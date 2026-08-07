@@ -1,0 +1,167 @@
+@import url('https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@300;400;500;600;700;800&family=Space+Grotesk:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap');
+@import "tailwindcss";
+
+@theme {
+  --font-sans: "Plus Jakarta Sans", ui-sans-serif, system-ui, sans-serif;
+  --font-mono: "JetBrains Mono", ui-monospace, SFMono-Regular, monospace;
+  --font-display: "Space Grotesk", sans-serif;
+}
+
+@keyframes fadeIn {
+  from { opacity: 0; transform: translateY(10px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+@keyframes floatSlow {
+  0%, 100% { transform: translateY(0px); }
+  50% { transform: translateY(-8px); }
+}
+
+@keyframes pulseGlow {
+  0%, 100% { opacity: 0.35; transform: scale(1); filter: blur(40px); }
+  50% { opacity: 0.65; transform: scale(1.08); filter: blur(50px); }
+}
+
+@keyframes shimmer {
+  0% { background-position: -200% 0; }
+  100% { background-position: 200% 0; }
+}
+
+@keyframes glowBorder {
+  0%, 100% { border-color: rgba(220, 38, 38, 0.2); }
+  50% { border-color: rgba(239, 68, 68, 0.6); }
+}
+
+.animate-shimmer {
+  background: linear-gradient(
+    90deg, 
+    rgba(255, 255, 255, 0.03) 0%, 
+    rgba(255, 255, 255, 0.1) 50%, 
+    rgba(255, 255, 255, 0.03) 100%
+  );
+  background-size: 200% 100%;
+  animation: shimmer 1.6s infinite linear;
+}
+
+.animate-fade-in {
+  animation: fadeIn 0.4s cubic-bezier(0.16, 1, 0.3, 1) forwards;
+}
+
+.animate-float {
+  animation: floatSlow 5s ease-in-out infinite;
+}
+
+.animate-pulse-glow {
+  animation: pulseGlow 4s ease-in-out infinite;
+}
+
+.animate-glow-border {
+  animation: glowBorder 3s ease-in-out infinite;
+}
+
+/* Glassmorphism & Cinematic Panels */
+.glass-panel {
+  background: rgba(14, 14, 19, 0.78);
+  backdrop-filter: blur(24px);
+  -webkit-backdrop-filter: blur(24px);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  box-shadow: 0 20px 50px -15px rgba(0, 0, 0, 0.8), 0 0 1px 1px rgba(255, 255, 255, 0.05) inset;
+}
+
+.glass-panel-light {
+  background: rgba(255, 255, 255, 0.88);
+  backdrop-filter: blur(24px);
+  -webkit-backdrop-filter: blur(24px);
+  border: 1px solid rgba(0, 0, 0, 0.08);
+  box-shadow: 0 20px 45px -15px rgba(0, 0, 0, 0.1), 0 0 1px 1px rgba(255, 255, 255, 0.9) inset;
+}
+
+.glass-card {
+  background: rgba(24, 24, 30, 0.6);
+  backdrop-filter: blur(16px);
+  -webkit-backdrop-filter: blur(16px);
+  border: 1px solid rgba(255, 255, 255, 0.07);
+  transition: all 0.35s cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+.glass-card:hover {
+  background: rgba(30, 30, 38, 0.8);
+  border-color: rgba(239, 68, 68, 0.35);
+  box-shadow: 0 22px 45px -15px rgba(220, 38, 38, 0.22), 0 10px 20px -8px rgba(0, 0, 0, 0.9);
+  transform: translateY(-4px) scale(1.01);
+}
+
+.cinematic-card {
+  transition: all 0.35s cubic-bezier(0.16, 1, 0.3, 1);
+  border: 1px solid rgba(255, 255, 255, 0.07);
+}
+
+.cinematic-card:hover {
+  transform: translateY(-5px) scale(1.015);
+  border-color: rgba(239, 68, 68, 0.4);
+  box-shadow: 0 24px 48px -15px rgba(220, 38, 38, 0.3), 0 10px 20px -8px rgba(0, 0, 0, 0.9);
+}
+
+.animated-btn {
+  transition: all 0.25s cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+.animated-btn:hover {
+  transform: translateY(-2px);
+  box-shadow: 0 10px 25px -4px rgba(220, 38, 38, 0.45);
+}
+
+.animated-btn:active {
+  transform: translateY(0.5px) scale(0.97);
+}
+
+/* Red Glow Effects */
+.red-glow {
+  box-shadow: 0 0 25px -5px rgba(220, 38, 38, 0.4);
+}
+
+.red-glow-lg {
+  box-shadow: 0 0 50px -10px rgba(220, 38, 38, 0.5);
+}
+
+.red-text-glow {
+  text-shadow: 0 0 12px rgba(239, 68, 68, 0.5);
+}
+
+/* Ambient glow background accents */
+.ambient-glow-red {
+  position: absolute;
+  width: 450px;
+  height: 450px;
+  background: radial-gradient(circle, rgba(220, 38, 38, 0.16) 0%, rgba(0,0,0,0) 70%);
+  pointer-events: none;
+  z-index: 0;
+}
+
+/* Custom minimalist scrollbars */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+
+::-webkit-scrollbar-track {
+  background: rgba(9, 9, 11, 0.6);
+}
+
+::-webkit-scrollbar-thumb {
+  background: rgba(255, 255, 255, 0.14);
+  border-radius: 9999px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: rgba(239, 68, 68, 0.6);
+}
+
+body {
+  background-color: #09090B;
+  color: #f4f4f5;
+  font-family: var(--font-sans);
+  overflow-x: hidden;
+}
+
+

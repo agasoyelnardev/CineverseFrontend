@@ -1,0 +1,6 @@
+{
+  "name": "CineVerse",
+  "description": "Azərbaycan dilində sosial yayım, kino icması, canlı yayımlar, kinoteatr rejimi, səsli rəylər və ortaq pleylistlər platforması.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
