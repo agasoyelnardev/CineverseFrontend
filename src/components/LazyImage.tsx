@@ -48,7 +48,14 @@ export const LazyImage: React.FC<LazyImageProps> = ({
           loading="lazy"
           decoding="async"
           onLoad={() => setIsLoaded(true)}
-          onError={() => setHasError(true)}
+          onError={(e) => {
+  console.error('❌ LazyImage image error');
+  console.error('SRC:', src);
+  console.error('ALT:', alt);
+  console.error('CURRENT SRC:', e.currentTarget.src);
+
+  setHasError(true);
+}}
           className={`w-full h-full object-cover transition-all duration-500 ease-out ${
             isLoaded ? 'opacity-100 filter-none scale-100' : 'opacity-0 filter blur-md scale-105'
           } ${className}`}

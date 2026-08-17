@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useMemo } from 'react';
 import { Users, Film, MessageSquare, Folder, Plus, Trash2, Edit3, BookOpen, TrendingUp, ShieldCheck, Ban, CheckCircle, BarChart3, Search, Download, RefreshCw, Globe, AlertCircle, FileText, UploadCloud, Link, FilePlus, Radio, Tv, Play, Power, Video, Layers, Wifi, X, ArrowLeft } from 'lucide-react';
 import { Movie, User, Book, BookVsMovie } from '../types';
 import {
@@ -7,6 +7,7 @@ import {
   apiDeleteMovie,
   apiSearchTmdb,
   apiImportTmdb,
+  apiImportTmdbBatch,
   apiCreateBook,
   apiUpdateBook,
   apiDeleteBook,
@@ -14,17 +15,33 @@ import {
   apiImportGoogleBook,
   apiUploadPdf,
   apiUpdateProfile,
-  apiToggleUserRole,
-  apiSetUserRole,
-  apiSetUserStatus,
-  apiDeleteUser,
   apiCreateLiveStreamChannel,
   apiToggleLiveStream,
+  apiUpdateLiveStreamChannel,
+  apiDeleteLiveStreamChannel,
   apiGetLiveStreams,
   apiCreateBookVsMovie,
   apiDeleteBookVsMovie,
-  apiGetAllBookVsMovies
+  apiGetAllBookVsMovies,
+  apiDeleteAdminReview,
+  apiDeleteAdminBookReview,
+  apiCloseAdminRoom,
+  apiGetActiveRooms,
+  AdminUserDto,
+  AdminStatsDto,
+  RecentReviewDto,
 } from '../api';
+import AdminAnalyticsModeration from './AdminAnalyticsModeration';
+import {
+  useAdminStatsQuery,
+  useAdminUsersQuery,
+  useAdminActivityLogsQuery,
+  useAdminRecentActivityQuery,
+  useToggleBanMutation,
+  useUpdateRolesMutation,
+  useDeleteUserMutation,
+} from '../hooks/useApiQueries';
+import { mapBackendBook } from '../utils/mapBook';
 
 interface AdminPanelProps {
   movies: Movie[];
@@ -49,7 +66,145 @@ export default function AdminPanel({
   bookVsMovies = [],
   setBookVsMovies
 }: AdminPanelProps) {
-  const [activeTab, setActiveTab] = useState<'stats' | 'movies' | 'users' | 'books' | 'livestreams' | 'bookVsMovies'>('stats');
+  const [activeTab, setActiveTab] = useState<'stats' | 'movies' | 'users' | 'books' | 'livestreams' | 'bookVsMovies' | 'analytics' | 'moderation'>('stats');
+
+  const statsEnabled = activeTab === 'stats';
+  const usersTabEnabled = activeTab === 'users';
+
+  const {
+    data: adminStats,
+    isLoading: isStatsLoading,
+    isError: isStatsError,
+    error: statsError,
+    refetch: refetchStats,
+  } = useAdminStatsQuery(statsEnabled);
+
+  const {
+    data: recentActivity,
+    isLoading: isRecentActivityLoading,
+    isError: isRecentActivityError,
+    refetch: refetchRecentActivity,
+  } = useAdminRecentActivityQuery(statsEnabled);
+
+  const {
+    data: activityLogs,
+    isLoading: isActivityLogsLoading,
+    isError: isActivityLogsError,
+    refetch: refetchActivityLogs,
+  } = useAdminActivityLogsQuery(statsEnabled);
+
+  const {
+    data: adminUsersResponse,
+    isLoading: isAdminUsersLoading,
+    isError: isAdminUsersError,
+    error: adminUsersError,
+    refetch: refetchAdminUsers,
+  } = useAdminUsersQuery(undefined, undefined, 1, 50, usersTabEnabled);
+
+  const toggleBanMutation = useToggleBanMutation();
+  const updateRolesMutation = useUpdateRolesMutation();
+  const deleteUserMutation = useDeleteUserMutation();
+
+  const adminUsers = useMemo((): AdminUserDto[] => {
+    if (!adminUsersResponse) return [];
+    if (Array.isArray(adminUsersResponse)) return adminUsersResponse;
+    return adminUsersResponse.items ?? [];
+  }, [adminUsersResponse]);
+
+  const formatAdminDate = (value?: string) => {
+    if (!value) return '—';
+    const date = new Date(value);
+    if (Number.isNaN(date.getTime())) return '—';
+    return date.toLocaleString('az-AZ', {
+      day: '2-digit',
+      month: '2-digit',
+      year: 'numeric',
+      hour: '2-digit',
+      minute: '2-digit',
+    });
+  };
+
+  const getAdminUserRoleLabel = (roles: string[]) =>
+    roles.some((role) => role.toLowerCase() === 'admin') ? 'admin' : 'user';
+
+  const handleRefreshAdminData = () => {
+    if (activeTab === 'stats') {
+      refetchStats();
+      refetchRecentActivity();
+      refetchActivityLogs();
+    } else if (activeTab === 'users') {
+      refetchAdminUsers();
+    }
+  };
+
+  const isAdminDataLoading =
+    statsEnabled &&
+    (isStatsLoading || isRecentActivityLoading || isActivityLogsLoading);
+
+  const hasAdminDataError =
+    statsEnabled &&
+    (isStatsError || isRecentActivityError || isActivityLogsError);
+
+  const stats: AdminStatsDto | null = adminStats ?? null;
+  const recentUsers = recentActivity?.recentUsers ?? [];
+  const recentReviews = recentActivity?.recentReviews ?? [];
+  const logs = activityLogs ?? [];
+  const [activeRooms, setActiveRooms] = useState<any[]>([]);
+  const [isRoomsLoading, setIsRoomsLoading] = useState(false);
+  const [moderationBusyId, setModerationBusyId] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (!statsEnabled) return;
+    let cancelled = false;
+    const loadActiveRooms = async () => {
+      setIsRoomsLoading(true);
+      try {
+        const rooms = await apiGetActiveRooms();
+        if (!cancelled && Array.isArray(rooms)) {
+          setActiveRooms(rooms);
+        }
+      } catch (err) {
+        console.warn('Aktiv otaqlar yüklənə bilmədi:', err);
+      } finally {
+        if (!cancelled) setIsRoomsLoading(false);
+      }
+    };
+    loadActiveRooms();
+    return () => { cancelled = true; };
+  }, [statsEnabled]);
+
+  const handleDeleteRecentReview = async (review: RecentReviewDto) => {
+    if (!window.confirm('Bu rəyi silmək istədiyinizdən əminsiniz?')) return;
+    const reviewId = String(review.id);
+    setModerationBusyId(reviewId);
+    try {
+      if (review.type === 'Book') {
+        await apiDeleteAdminBookReview(reviewId);
+      } else {
+        await apiDeleteAdminReview(reviewId);
+      }
+      await refetchRecentActivity();
+    } catch (err) {
+      console.error('Rəy silinmədi:', err);
+      alert('Rəy silinərkən xəta baş verdi.');
+    } finally {
+      setModerationBusyId(null);
+    }
+  };
+
+  const handleCloseActiveRoom = async (roomId: string) => {
+    if (!window.confirm('Bu watch party otağını bağlamaq istədiyinizdən əminsiniz?')) return;
+    setModerationBusyId(roomId);
+    try {
+      await apiCloseAdminRoom(roomId);
+      setActiveRooms((prev) => prev.filter((room) => String(room.id) !== String(roomId)));
+    } catch (err) {
+      console.error('Otaq bağlanmadı:', err);
+      alert('Otaq bağlanarkən xəta baş verdi.');
+    } finally {
+      setModerationBusyId(null);
+    }
+  };
 
   // Book vs Movie Creation State
   const [isCreatingBvm, setIsCreatingBvm] = useState(false);
@@ -62,28 +217,7 @@ export default function AdminPanel({
   const [newBvmCustomMovieTitle, setNewBvmCustomMovieTitle] = useState('');
   
   // Live Stream Form State
-  const [liveStreams, setLiveStreams] = useState<any[]>([
-    {
-      id: 'ls_cinema_plus',
-      channelKey: 'cinema-plus',
-      title: 'CineVerse Cinema Plus 4K Canlı',
-      description: 'Premyera filmlər, eksklüziv yayımlar və kino şouları.',
-      streamUrl: 'https://test-streams.mux.dev/x36xhzz/x36xhzz.m3u8',
-      thumbnailUrl: 'https://images.unsplash.com/photo-1489599849927-2ee91cede3ba?w=800&auto=format&fit=crop&q=80',
-      category: 'Movie',
-      isLive: true
-    },
-    {
-      id: 'ls_nolan_marathon',
-      channelKey: 'nolan-marathon',
-      title: 'Christopher Nolan Xüsusi Yayımı',
-      description: 'Nolan kinosevərləri üçün 24/7 rejissor maratonu.',
-      streamUrl: 'https://test-streams.mux.dev/x36xhzz/x36xhzz.m3u8',
-      thumbnailUrl: 'https://images.unsplash.com/photo-1419242902214-272b3f66ee7a?w=800&auto=format&fit=crop&q=80',
-      category: 'Movie',
-      isLive: false
-    }
-  ]);
+  const [liveStreams, setLiveStreams] = useState<any[]>([]);
   const [isLiveStreamsLoading, setIsLiveStreamsLoading] = useState(false);
   const [isCreatingLiveStreamPage, setIsCreatingLiveStreamPage] = useState(false);
   const [isSubmittingLiveStream, setIsSubmittingLiveStream] = useState(false);
@@ -96,12 +230,22 @@ export default function AdminPanel({
     thumbnailUrl: '',
     category: 'Futbol' as string
   });
+  const [editingLiveStreamId, setEditingLiveStreamId] = useState<string | null>(null);
+  const [editLiveStream, setEditLiveStream] = useState({
+    channelKey: '',
+    title: '',
+    description: '',
+    streamUrl: '',
+    thumbnailUrl: '',
+    category: 'Futbol' as string
+  });
+  const [isSubmittingLiveStreamEdit, setIsSubmittingLiveStreamEdit] = useState(false);
 
   const fetchLiveStreams = async () => {
     setIsLiveStreamsLoading(true);
     try {
       const res = await apiGetLiveStreams();
-      if (Array.isArray(res) && res.length > 0) {
+      if (Array.isArray(res)) {
         setLiveStreams(res);
       }
     } catch (err) {
@@ -406,12 +550,81 @@ export default function AdminPanel({
       });
     } catch (err: any) {
       console.log('Toggle live stream error:', err);
-      const newStatus = !currentStatus;
-      setLiveStreams(prev => prev.map(s => (s.id === id || s.channelKey === id) ? { ...s, isLive: newStatus } : s));
       setApiMessage({
-        type: 'success',
-        text: newStatus ? 'Yayım başlama statusu yeniləndi (IsLive: true).' : 'Yayım statusu passiv edildi (IsLive: false).'
+        type: 'error',
+        text: err?.message || 'Yayım statusu yenilənə bilmədi. Zəhmət olmasa yenidən cəhd edin.',
       });
+    }
+  };
+
+  const openEditLiveStream = (stream: any) => {
+    setEditingLiveStreamId(stream.id || stream.channelKey);
+    setEditLiveStream({
+      channelKey: stream.channelKey || '',
+      title: stream.title || '',
+      description: stream.description || '',
+      streamUrl: stream.streamUrl || '',
+      thumbnailUrl: stream.thumbnailUrl || '',
+      category: stream.category || 'Futbol',
+    });
+  };
+
+  const handleUpdateLiveStream = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!editingLiveStreamId) return;
+    if (!editLiveStream.channelKey.trim() || !editLiveStream.title.trim() || !editLiveStream.streamUrl.trim()) {
+      setApiMessage({ type: 'error', text: 'Zəhmət olmasa Kanal Açarı, Başlıq və Yayım URL sahələrini doldurun.' });
+      return;
+    }
+
+    setIsSubmittingLiveStreamEdit(true);
+    setApiMessage(null);
+
+    try {
+      await apiUpdateLiveStreamChannel(editingLiveStreamId, {
+        channelKey: editLiveStream.channelKey.trim(),
+        title: editLiveStream.title.trim(),
+        description: editLiveStream.description.trim(),
+        streamUrl: editLiveStream.streamUrl.trim(),
+        thumbnailUrl: editLiveStream.thumbnailUrl.trim() || 'https://images.unsplash.com/photo-1536440136628-849c177e76a1?w=800&auto=format&fit=crop&q=80',
+        category: editLiveStream.category,
+      });
+
+      setLiveStreams(prev => prev.map(s => {
+        if (s.id !== editingLiveStreamId && s.channelKey !== editingLiveStreamId) return s;
+        return {
+          ...s,
+          channelKey: editLiveStream.channelKey.trim(),
+          title: editLiveStream.title.trim(),
+          description: editLiveStream.description.trim(),
+          streamUrl: editLiveStream.streamUrl.trim(),
+          thumbnailUrl: editLiveStream.thumbnailUrl.trim() || 'https://images.unsplash.com/photo-1536440136628-849c177e76a1?w=800&auto=format&fit=crop&q=80',
+          category: editLiveStream.category,
+        };
+      }));
+
+      setApiMessage({ type: 'success', text: `"${editLiveStream.title}" kanalı uğurla yeniləndi (PUT /api/livestreams/admin/${editingLiveStreamId}).` });
+      setEditingLiveStreamId(null);
+    } catch (err: any) {
+      setApiMessage({ type: 'error', text: err?.message || 'Kanal yenilənərkən xəta baş verdi.' });
+    } finally {
+      setIsSubmittingLiveStreamEdit(false);
+    }
+  };
+
+  const handleDeleteLiveStream = async (id: string) => {
+    if (!window.confirm('Bu canlı yayım kanalını silməyə əminsiniz?')) return;
+
+    setApiMessage(null);
+    try {
+      await apiDeleteLiveStreamChannel(id);
+      setLiveStreams(prev => prev.filter(s => s.id !== id && s.channelKey !== id));
+      if (editingLiveStreamId === id) {
+        setEditingLiveStreamId(null);
+      }
+      setApiMessage({ type: 'success', text: 'Canlı yayım kanalı uğurla silindi.' });
+    } catch (err: any) {
+      setApiMessage({ type: 'error', text: err?.message || 'Kanal silinərkən xəta baş verdi.' });
     }
   };
   
@@ -420,12 +633,22 @@ export default function AdminPanel({
   const [tmdbResults, setTmdbResults] = useState<any[]>([]);
   const [isSearchingTmdb, setIsSearchingTmdb] = useState(false);
   const [importingTmdbId, setImportingTmdbId] = useState<number | null>(null);
+  const [selectedTmdbIds, setSelectedTmdbIds] = useState<number[]>([]);
+  const [tmdbBulkProgress, setTmdbBulkProgress] = useState<{ current: number; total: number; running: boolean } | null>(null);
 
   // Google Books Import State
   const [googleBooksQuery, setGoogleBooksQuery] = useState('');
   const [googleBooksResults, setGoogleBooksResults] = useState<any[]>([]);
   const [isSearchingGoogleBooks, setIsSearchingGoogleBooks] = useState(false);
   const [importingGoogleBooksId, setImportingGoogleBooksId] = useState<string | null>(null);
+  const [selectedGoogleBookIds, setSelectedGoogleBookIds] = useState<string[]>([]);
+  const [googleBooksQueueProgress, setGoogleBooksQueueProgress] = useState<{
+    current: number;
+    total: number;
+    running: boolean;
+    succeeded: number;
+    failed: number;
+  } | null>(null);
 
   const [apiMessage, setApiMessage] = useState<{ type: 'success' | 'error'; text: string } | null>(null);
 
@@ -705,9 +928,6 @@ export default function AdminPanel({
     setShowAddMovieModal(true);
   };
 
-  // Total review count
-  const totalReviews = movies.reduce((acc, m) => acc + (m.reviews?.length || 0), 0);
-
   // TMDB Handlers
   const handleSearchTmdb = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -798,6 +1018,33 @@ export default function AdminPanel({
     }
   };
 
+  const toggleTmdbSelection = (tmdbId: number) => {
+    setSelectedTmdbIds((prev) =>
+      prev.includes(tmdbId) ? prev.filter((id) => id !== tmdbId) : [...prev, tmdbId],
+    );
+  };
+
+  const handleBulkImportTmdb = async () => {
+    if (selectedTmdbIds.length === 0) {
+      setApiMessage({ type: 'error', text: 'Ən azı bir film seçin.' });
+      return;
+    }
+    setTmdbBulkProgress({ current: 0, total: selectedTmdbIds.length, running: true });
+    setApiMessage(null);
+    try {
+      const result = await apiImportTmdbBatch(selectedTmdbIds);
+      setTmdbBulkProgress({ current: result.total, total: result.total, running: false });
+      setApiMessage({
+        type: result.failed > 0 ? 'error' : 'success',
+        text: `Toplu idxal: ${result.succeeded}/${result.total} uğurlu, ${result.failed} uğursuz.`,
+      });
+      setSelectedTmdbIds([]);
+    } catch (err: any) {
+      setApiMessage({ type: 'error', text: err?.message || 'Toplu TMDB idxalı uğursuz oldu.' });
+      setTmdbBulkProgress(null);
+    }
+  };
+
   // Google Books Handlers
   const handleSearchGoogleBooks = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -805,12 +1052,19 @@ export default function AdminPanel({
     setIsSearchingGoogleBooks(true);
     setApiMessage(null);
     try {
-      const results = await apiSearchGoogleBooks(googleBooksQuery);
-      const items = Array.isArray(results) ? results : (results?.items || results?.books || []);
+      const { items, warning } = await apiSearchGoogleBooks(googleBooksQuery);
       setGoogleBooksResults(items);
+      if (warning) {
+        setApiMessage({ type: 'error', text: warning });
+      } else if (items.length === 0) {
+        setApiMessage({ type: 'error', text: 'Axtarış üzrə nəticə tapılmadı.' });
+      }
     } catch (err: any) {
       setGoogleBooksResults([]);
-      setApiMessage({ type: 'error', text: err.message || 'Google Books axtarışında xəta baş verdi' });
+      setApiMessage({
+        type: 'error',
+        text: err.message || 'Google Books axtarışında xəta baş verdi. PDF panelindən əl ilə əlavə edə bilərsiniz.',
+      });
     } finally {
       setIsSearchingGoogleBooks(false);
     }
@@ -820,16 +1074,73 @@ export default function AdminPanel({
     setImportingGoogleBooksId(googleBooksId);
     setApiMessage(null);
     try {
-      const importedBook = await apiImportGoogleBook(googleBooksId);
-      if (importedBook && setBooks) {
-        setBooks(prev => [importedBook, ...prev]);
-        setApiMessage({ type: 'success', text: 'Kitab Google Books-dan Uğurla İdxal Edildi!' });
+      const importedRaw = await apiImportGoogleBook(googleBooksId);
+      const importedBook = mapBackendBook(importedRaw);
+      if (importedBook.id && setBooks) {
+        setBooks(prev => [importedBook, ...prev.filter(b => b.id !== importedBook.id)]);
+        setApiMessage({ type: 'success', text: 'Kitab Google Books-dan uğurla idxal edildi!' });
       }
     } catch (err: any) {
-      setApiMessage({ type: 'error', text: err.message || 'Google Books idxalında xəta baş verdi' });
+      const raw = err?.message || '';
+      const friendly = raw.includes('Google Books')
+        ? 'Google Books hazırda əlçatan deyil. Kitab məlumatlarını və PDF-i yuxarıdakı formadan əl ilə əlavə edin.'
+        : (raw || 'Google Books idxalında xəta baş verdi.');
+      setApiMessage({ type: 'error', text: friendly });
     } finally {
       setImportingGoogleBooksId(null);
     }
+  };
+
+  const toggleGoogleBookSelection = (bookId: string) => {
+    setSelectedGoogleBookIds((prev) =>
+      prev.includes(bookId) ? prev.filter((id) => id !== bookId) : [...prev, bookId],
+    );
+  };
+
+  const handleGoogleBooksQueueImport = async () => {
+    if (selectedGoogleBookIds.length === 0) {
+      setApiMessage({ type: 'error', text: 'Ən azı bir kitab seçin.' });
+      return;
+    }
+    const queue = [...selectedGoogleBookIds];
+    setGoogleBooksQueueProgress({
+      current: 0,
+      total: queue.length,
+      running: true,
+      succeeded: 0,
+      failed: 0,
+    });
+    setApiMessage(null);
+
+    let succeeded = 0;
+    let failed = 0;
+
+    for (let i = 0; i < queue.length; i++) {
+      const bookId = queue[i];
+      try {
+        const importedRaw = await apiImportGoogleBook(bookId);
+        const importedBook = mapBackendBook(importedRaw);
+        if (importedBook.id && setBooks) {
+          setBooks((prev) => [importedBook, ...prev.filter((b) => b.id !== importedBook.id)]);
+        }
+        succeeded++;
+      } catch {
+        failed++;
+      }
+      setGoogleBooksQueueProgress({
+        current: i + 1,
+        total: queue.length,
+        running: i + 1 < queue.length,
+        succeeded,
+        failed,
+      });
+    }
+
+    setSelectedGoogleBookIds([]);
+    setApiMessage({
+      type: failed > 0 ? 'error' : 'success',
+      text: `Google Books növbəsi: ${succeeded}/${queue.length} uğurlu, ${failed} uğursuz.`,
+    });
   };
 
   // Handle Add / Edit Movie
@@ -1092,66 +1403,60 @@ export default function AdminPanel({
 
   // Handle User Role Change
   const toggleUserRole = async (userId: string) => {
-    const targetUser = users.find(u => u.id === userId);
+    const targetUser = adminUsers.find((u) => u.id === userId);
     if (!targetUser) return;
-    const newRole = targetUser.role === 'admin' ? 'user' : 'admin';
+
+    const isCurrentlyAdmin = targetUser.roles.some((role) => role.toLowerCase() === 'admin');
+    const newRoles = isCurrentlyAdmin ? ['User'] : ['Admin'];
 
     try {
-      await apiToggleUserRole(userId);
-      setApiMessage({ type: 'success', text: `İstifadəçi rolu (${newRole}) yeniləndi.` });
+      await updateRolesMutation.mutateAsync({ userId, roles: newRoles });
+      setApiMessage({
+        type: 'success',
+        text: `İstifadəçi rolu ${isCurrentlyAdmin ? 'User' : 'Admin'} olaraq yeniləndi.`,
+      });
+      refetchAdminUsers();
     } catch (err: any) {
-      console.log('Backend role toggle fallback:', err.message);
+      setApiMessage({ type: 'error', text: err?.message || 'Rol yenilənmədi.' });
     }
-
-    setUsers(prev => prev.map(u => {
-      if (u.id === userId) {
-        return { ...u, role: newRole };
-      }
-      return u;
-    }));
   };
 
   // Handle Delete User
   const handleDeleteUser = async (userId: string) => {
     if (window.confirm('Bu istifadəçini silmək istədiyinizdən əminsiniz?')) {
       try {
-        await apiDeleteUser(userId);
+        await deleteUserMutation.mutateAsync(userId);
         setApiMessage({ type: 'success', text: 'İstifadəçi bazadan silindi.' });
+        setUsers((prev) => prev.filter((u) => u.id !== userId));
+        refetchAdminUsers();
       } catch (err: any) {
-        console.log('Backend delete user error:', err.message);
+        setApiMessage({ type: 'error', text: err?.message || 'İstifadəçi silinmədi.' });
       }
-      setUsers(prev => prev.filter(u => u.id !== userId));
     }
   };
 
-  // Handle Ban User (Set status via backend API)
-  const [bannedUsers, setBannedUsers] = useState<string[]>([]);
   const toggleBanUser = async (userId: string) => {
-    const isCurrentlyBanned = bannedUsers.includes(userId);
-    const newBlockedState = !isCurrentlyBanned;
+    const targetUser = adminUsers.find((u) => u.id === userId);
+    if (!targetUser) return;
 
-    if (!isCurrentlyBanned && !window.confirm('Bu istifadəçini bloklamaq istəyirsiniz?')) {
+    if (!targetUser.isBanned && !window.confirm('Bu istifadəçini bloklamaq istəyirsiniz?')) {
       return;
     }
 
     try {
-      await apiSetUserStatus(userId, newBlockedState, newBlockedState ? 'Admin tərəfindən bloklandı' : undefined);
+      await toggleBanMutation.mutateAsync({
+        userId,
+        banReason: targetUser.isBanned ? undefined : 'Admin tərəfindən bloklandı',
+      });
       setApiMessage({
         type: 'success',
-        text: newBlockedState ? 'İstifadəçi uğurla bloklandı.' : 'İstifadəçinin bloku ləğv edildi.'
+        text: targetUser.isBanned
+          ? 'İstifadəçinin bloku ləğv edildi.'
+          : 'İstifadəçi uğurla bloklandı.',
       });
-      if (newBlockedState) {
-        setBannedUsers(prev => [...prev, userId]);
-      } else {
-        setBannedUsers(prev => prev.filter(id => id !== userId));
-      }
+      refetchAdminUsers();
     } catch (err: any) {
-      console.log('Backend set status fallback:', err.message);
-      if (newBlockedState) {
-        setBannedUsers(prev => [...prev, userId]);
-      } else {
-        setBannedUsers(prev => prev.filter(id => id !== userId));
-      }
+      setApiMessage({ type: 'error', text: err?.message || 'Bloklama statusu yenilənmədi.' });
     }
   };
 
@@ -1391,7 +1696,23 @@ export default function AdminPanel({
           <h1 className="text-xl font-bold tracking-tight font-display">İdarəetmə Paneli (Admin)</h1>
           <p className="text-xs text-zinc-500 mt-1">Platformanın statistikası, istifadəçi, film və kitabların idarə olunması.</p>
         </div>
-        <div className="flex gap-2 flex-wrap">
+        <div className="flex gap-2 flex-wrap items-center">
+          {(activeTab === 'stats' || activeTab === 'users') && (
+            <button
+              type="button"
+              onClick={handleRefreshAdminData}
+              disabled={isAdminDataLoading || (usersTabEnabled && isAdminUsersLoading)}
+              className={`py-1.5 px-3 rounded-full text-[10px] uppercase tracking-wider font-bold cursor-pointer transition flex items-center gap-1.5 ${
+                theme === 'dark'
+                  ? 'bg-white/5 hover:bg-white/10 text-zinc-300 border border-white/5'
+                  : 'bg-zinc-100 hover:bg-zinc-200 text-zinc-700 border border-zinc-200'
+              } disabled:opacity-50`}
+              title="Backend məlumatlarını yenilə"
+            >
+              <RefreshCw className={`w-3 h-3 ${isAdminDataLoading || (usersTabEnabled && isAdminUsersLoading) ? 'animate-spin' : ''}`} />
+              Yenilə
+            </button>
+          )}
           <button
             onClick={() => setActiveTab('stats')}
             className={`py-1.5 px-3.5 rounded-full text-[10px] uppercase tracking-wider font-bold cursor-pointer transition ${
@@ -1466,6 +1787,32 @@ export default function AdminPanel({
             <Layers className="w-3 h-3 text-red-500" />
             Kitab vs Film
           </button>
+          <button
+            onClick={() => setActiveTab('analytics')}
+            className={`py-1.5 px-3.5 rounded-full text-[10px] uppercase tracking-wider font-bold cursor-pointer transition flex items-center gap-1.5 ${
+              activeTab === 'analytics'
+                ? 'bg-red-600 text-white shadow-lg shadow-red-600/10'
+                : theme === 'dark'
+                ? 'bg-white/5 hover:bg-white/10 text-zinc-350 border border-white/5'
+                : 'bg-zinc-100 hover:bg-zinc-200 text-zinc-700 border border-zinc-200'
+            }`}
+          >
+            <BarChart3 className="w-3 h-3" />
+            Analitika
+          </button>
+          <button
+            onClick={() => setActiveTab('moderation')}
+            className={`py-1.5 px-3.5 rounded-full text-[10px] uppercase tracking-wider font-bold cursor-pointer transition flex items-center gap-1.5 ${
+              activeTab === 'moderation'
+                ? 'bg-red-600 text-white shadow-lg shadow-red-600/10'
+                : theme === 'dark'
+                ? 'bg-white/5 hover:bg-white/10 text-zinc-350 border border-white/5'
+                : 'bg-zinc-100 hover:bg-zinc-200 text-zinc-700 border border-zinc-200'
+            }`}
+          >
+            <ShieldCheck className="w-3 h-3" />
+            Moderasiya
+          </button>
         </div>
       </div>
 
@@ -1492,6 +1839,27 @@ export default function AdminPanel({
       {/* Overview stats */}
       {activeTab === 'stats' && (
         <div className="space-y-8 animate-fade-in">
+          {hasAdminDataError && (
+            <div className={`p-4 rounded-2xl border flex items-center justify-between gap-3 text-xs ${
+              theme === 'dark' ? 'bg-red-500/10 border-red-500/20 text-red-400' : 'bg-red-50 border-red-200 text-red-600'
+            }`}>
+              <div className="flex items-center gap-2">
+                <AlertCircle className="w-4 h-4 shrink-0" />
+                <span>
+                  Admin məlumatları yüklənə bilmədi
+                  {statsError instanceof Error ? `: ${statsError.message}` : '.'}
+                </span>
+              </div>
+              <button
+                type="button"
+                onClick={handleRefreshAdminData}
+                className="px-3 py-1.5 rounded-lg bg-red-500/10 hover:bg-red-500/20 font-bold transition"
+              >
+                Yenidən cəhd et
+              </button>
+            </div>
+          )}
+
           {/* Statistics widgets */}
           <div className="grid grid-cols-2 lg:grid-cols-4 gap-4">
             <div className={`p-5 rounded-2xl border backdrop-blur-xl ${
@@ -1501,10 +1869,16 @@ export default function AdminPanel({
                 <span className="text-[10px] text-zinc-500 font-bold uppercase tracking-wider font-mono">İstifadəçilər</span>
                 <Users className="w-4 h-4 text-zinc-400" />
               </div>
-              <p className="text-2xl font-black mt-3 font-mono tracking-tight">{users.length}</p>
+              <p className="text-2xl font-black mt-3 font-mono tracking-tight">
+                {isStatsLoading ? '...' : (stats?.totalUsers ?? 0)}
+              </p>
               <div className="flex items-center gap-1 mt-2 text-green-500 text-[10px] font-mono">
                 <TrendingUp className="w-3 h-3" />
-                <span>+12% bu ay</span>
+                <span>
+                  {isStatsLoading
+                    ? 'Yüklənir...'
+                    : `${stats?.activeUsersCount ?? 0} aktiv • ${stats?.blockedUsersCount ?? 0} blok`}
+                </span>
               </div>
             </div>
 
@@ -1515,10 +1889,16 @@ export default function AdminPanel({
                 <span className="text-[10px] text-zinc-500 font-bold uppercase tracking-wider font-mono">Ümumi Film</span>
                 <Film className="w-4 h-4 text-red-500" />
               </div>
-              <p className="text-2xl font-black mt-3 font-mono tracking-tight">{movies.length}</p>
+              <p className="text-2xl font-black mt-3 font-mono tracking-tight">
+                {isStatsLoading ? '...' : (stats?.totalMovies ?? 0)}
+              </p>
               <div className="flex items-center gap-1 mt-2 text-green-500 text-[10px] font-mono">
                 <TrendingUp className="w-3 h-3" />
-                <span>+4 yeni film</span>
+                <span>
+                  {isStatsLoading
+                    ? 'Yüklənir...'
+                    : `${stats?.activeRoomsCount ?? 0} aktiv otaq`}
+                </span>
               </div>
             </div>
 
@@ -1529,10 +1909,18 @@ export default function AdminPanel({
                 <span className="text-xs text-zinc-500 font-medium uppercase tracking-wider">Yazılan Rəylər</span>
                 <MessageSquare className="w-5 h-5 text-emerald-500" />
               </div>
-              <p className="text-3xl font-extrabold mt-3 font-mono">{totalReviews}</p>
+              <p className="text-3xl font-extrabold mt-3 font-mono">
+                {isStatsLoading
+                  ? '...'
+                  : (stats?.totalReviews ?? 0) + (stats?.totalBookReviews ?? 0)}
+              </p>
               <div className="flex items-center gap-1 mt-2 text-green-500 text-[10px] font-semibold">
                 <TrendingUp className="w-3 h-3" />
-                <span>+24 rəy</span>
+                <span>
+                  {isStatsLoading
+                    ? 'Yüklənir...'
+                    : `${stats?.totalReviews ?? 0} film • ${stats?.totalBookReviews ?? 0} kitab`}
+                </span>
               </div>
             </div>
 
@@ -1543,105 +1931,185 @@ export default function AdminPanel({
                 <span className="text-xs text-zinc-500 font-medium uppercase tracking-wider">Ümumi Kitab</span>
                 <BookOpen className="w-5 h-5 text-amber-500" />
               </div>
-              <p className="text-3xl font-extrabold mt-3 font-mono">{books.length}</p>
+              <p className="text-3xl font-extrabold mt-3 font-mono">
+                {isStatsLoading ? '...' : (stats?.totalBooks ?? 0)}
+              </p>
               <div className="flex items-center gap-1 mt-2 text-green-500 text-[10px] font-semibold">
-                <span>Kitabxana aktivdir</span>
+                <span>
+                  {isStatsLoading
+                    ? 'Yüklənir...'
+                    : `${stats?.totalDiscussions ?? 0} müzakirə • ${stats?.premiumUsersCount ?? 0} premium`}
+                </span>
               </div>
             </div>
           </div>
 
-          {/* Graphical Analytics Section */}
+          {/* Recent Activity & Activity Logs */}
           <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
-            {/* User Registration Trend */}
             <div className={`p-6 rounded-3xl border ${
               theme === 'dark' ? 'bg-zinc-900/40 border-zinc-800' : 'bg-white border-zinc-200'
             }`}>
               <div className="flex items-center gap-2 mb-4">
                 <BarChart3 className="w-4.5 h-4.5 text-indigo-500" />
-                <h3 className="font-semibold text-sm">Həftəlik Giriş və Aktivlik Trafiki</h3>
+                <h3 className="font-semibold text-sm">Son Fəaliyyət</h3>
               </div>
-              <div className="h-64 flex items-end justify-between gap-2 pt-6">
-                {[
-                  { day: 'B.E', active: 75, auth: 25 },
-                  { day: 'Ç.A', active: 85, auth: 40 },
-                  { day: 'Ç', active: 60, auth: 15 },
-                  { day: 'C.A', active: 95, auth: 55 },
-                  { day: 'C', active: 110, auth: 60 },
-                  { day: 'Ş', active: 140, auth: 85 },
-                  { day: 'B', active: 160, auth: 95 }
-                ].map((item, idx) => (
-                  <div key={idx} className="flex-1 flex flex-col items-center gap-2">
-                    <div className="w-full flex justify-center gap-1 h-44 items-end">
-                      {/* Sub-bar 1 */}
-                      <div 
-                        style={{ height: `${item.auth}%` }} 
-                        className="w-3 bg-indigo-500 rounded-t-sm transition-all duration-1000"
-                        title={`Yeni Giriş: ${item.auth}`}
-                      />
-                      {/* Sub-bar 2 */}
-                      <div 
-                        style={{ height: `${item.active}%` }} 
-                        className="w-3 bg-red-600 rounded-t-sm transition-all duration-1000"
-                        title={`Aktiv Rəylər: ${item.active}`}
-                      />
-                    </div>
-                    <span className="text-[10px] text-zinc-500 font-medium">{item.day}</span>
+
+              {isRecentActivityLoading ? (
+                <div className="flex items-center justify-center py-16 text-zinc-500 text-xs gap-2">
+                  <RefreshCw className="w-4 h-4 animate-spin" />
+                  Son fəaliyyət yüklənir...
+                </div>
+              ) : isRecentActivityError ? (
+                <div className="py-10 text-center text-xs text-red-400">
+                  Son fəaliyyət yüklənə bilmədi.
+                </div>
+              ) : (
+                <div className="space-y-5 max-h-72 overflow-y-auto pr-1">
+                  <div>
+                    <p className="text-[10px] uppercase tracking-wider text-zinc-500 font-bold mb-2">Yeni İstifadəçilər</p>
+                    {recentUsers.length === 0 ? (
+                      <p className="text-xs text-zinc-500">Hələ qeydiyyat yoxdur.</p>
+                    ) : (
+                      <div className="space-y-2">
+                        {recentUsers.map((user) => (
+                          <div
+                            key={user.id}
+                            className={`flex items-center gap-3 p-2.5 rounded-xl border ${
+                              theme === 'dark' ? 'bg-zinc-950/50 border-zinc-800' : 'bg-zinc-50 border-zinc-200'
+                            }`}
+                          >
+                            <img
+                              src={user.avatar || 'https://images.unsplash.com/photo-1535713875002-d1d0cf377fde?w=100&auto=format&fit=crop&q=80'}
+                              alt={user.username}
+                              className="w-8 h-8 rounded-full object-cover"
+                            />
+                            <div className="flex-1 min-w-0">
+                              <p className="text-xs font-semibold truncate">@{user.username}</p>
+                              <p className="text-[10px] text-zinc-500">{formatAdminDate(user.createdAt)}</p>
+                            </div>
+                          </div>
+                        ))}
+                      </div>
+                    )}
                   </div>
-                ))}
-              </div>
-              <div className="flex items-center gap-4 justify-center mt-4">
-                <div className="flex items-center gap-1.5">
-                  <div className="w-2.5 h-2.5 bg-indigo-500 rounded-full" />
-                  <span className="text-[10px] text-zinc-500">Yeni Qeydiyyat</span>
+
+                  <div>
+                    <p className="text-[10px] uppercase tracking-wider text-zinc-500 font-bold mb-2">Son Rəylər</p>
+                    {recentReviews.length === 0 ? (
+                      <p className="text-xs text-zinc-500">Hələ rəy yoxdur.</p>
+                    ) : (
+                      <div className="space-y-2">
+                        {recentReviews.map((review) => (
+                          <div
+                            key={String(review.id)}
+                            className={`p-2.5 rounded-xl border ${
+                              theme === 'dark' ? 'bg-zinc-950/50 border-zinc-800' : 'bg-zinc-50 border-zinc-200'
+                            }`}
+                          >
+                            <div className="flex items-center justify-between gap-2 mb-1">
+                              <p className="text-xs font-semibold truncate">@{review.username}</p>
+                              <div className="flex items-center gap-2 shrink-0">
+                                <span className="text-[10px] text-amber-500 font-bold">★ {review.rating}</span>
+                                <span className="text-[9px] uppercase font-mono text-zinc-500">{review.type || 'Movie'}</span>
+                              </div>
+                            </div>
+                            <p className="text-[11px] font-medium truncate">
+                              {(review.targetTitle || review.movieTitle || '—')}
+                            </p>
+                            <p className="text-[10px] text-zinc-500 line-clamp-2 mt-1">{review.content}</p>
+                            <div className="flex items-center justify-between mt-2 gap-2">
+                              <p className="text-[10px] text-zinc-500">{formatAdminDate(review.createdAt)}</p>
+                              <button
+                                type="button"
+                                onClick={() => handleDeleteRecentReview(review)}
+                                disabled={moderationBusyId === String(review.id)}
+                                className="px-2 py-1 rounded-lg text-[10px] font-bold bg-red-600/15 text-red-400 hover:bg-red-600/25 transition cursor-pointer disabled:opacity-50"
+                              >
+                                {moderationBusyId === String(review.id) ? 'Silinir...' : 'Rəyi Sil'}
+                              </button>
+                            </div>
+                          </div>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+
+                  <div className="mt-6">
+                    <p className="text-[10px] uppercase tracking-wider text-zinc-500 font-bold mb-2">Aktiv Watch Party Otaqları</p>
+                    {isRoomsLoading ? (
+                      <p className="text-xs text-zinc-500">Otaqlar yüklənir...</p>
+                    ) : activeRooms.length === 0 ? (
+                      <p className="text-xs text-zinc-500">Hazırda aktiv otaq yoxdur.</p>
+                    ) : (
+                      <div className="space-y-2">
+                        {activeRooms.map((room) => (
+                          <div
+                            key={String(room.id)}
+                            className={`p-2.5 rounded-xl border flex items-center justify-between gap-3 ${
+                              theme === 'dark' ? 'bg-zinc-950/50 border-zinc-800' : 'bg-zinc-50 border-zinc-200'
+                            }`}
+                          >
+                            <div className="min-w-0">
+                              <p className="text-xs font-semibold truncate">{room.name || room.title || 'Watch Party'}</p>
+                              <p className="text-[10px] text-zinc-500 truncate">Host: {room.hostName || room.creator || '—'}</p>
+                            </div>
+                            <button
+                              type="button"
+                              onClick={() => handleCloseActiveRoom(String(room.id))}
+                              disabled={moderationBusyId === String(room.id)}
+                              className="px-2.5 py-1 rounded-lg text-[10px] font-bold bg-red-600/15 text-red-400 hover:bg-red-600/25 transition cursor-pointer disabled:opacity-50 shrink-0"
+                            >
+                              {moderationBusyId === String(room.id) ? 'Bağlanır...' : 'Otağı Bağla'}
+                            </button>
+                          </div>
+                        ))}
+                      </div>
+                    )}
+                  </div>
                 </div>
-                <div className="flex items-center gap-1.5">
-                  <div className="w-2.5 h-2.5 bg-red-600 rounded-full" />
-                  <span className="text-[10px] text-zinc-500">İzləmə Partiyası</span>
-                </div>
-              </div>
+              )}
             </div>
 
-            {/* Popular Genres stats */}
             <div className={`p-6 rounded-3xl border ${
               theme === 'dark' ? 'bg-zinc-900/40 border-zinc-800' : 'bg-white border-zinc-200'
             }`}>
-              <h3 className="font-semibold text-sm mb-4">Janrların İzlənmə Payı (%)</h3>
-              <div className="space-y-4">
-                {[
-                  { genre: 'Elmi-Fantastika', percentage: 42, color: 'bg-indigo-500' },
-                  { genre: 'Dram', percentage: 28, color: 'bg-emerald-500' },
-                  { genre: 'Aksiyon', percentage: 15, color: 'bg-red-500' },
-                  { genre: 'Animasiya', percentage: 10, color: 'bg-amber-500' },
-                  { genre: 'Triller', percentage: 5, color: 'bg-zinc-500' }
-                ].map((item, idx) => (
-                  <div key={idx} className="space-y-1">
-                    <div className="flex justify-between text-xs">
-                      <span className="font-medium">{item.genre}</span>
-                      <span className="font-semibold text-zinc-400">{item.percentage}%</span>
-                    </div>
-                    <div className="w-full h-2 bg-zinc-800/10 rounded-full overflow-hidden">
-                      <div className={`h-full ${item.color} rounded-full`} style={{ width: `${item.percentage}%` }} />
-                    </div>
-                  </div>
-                ))}
+              <div className="flex items-center gap-2 mb-4">
+                <ShieldCheck className="w-4.5 h-4.5 text-red-500" />
+                <h3 className="font-semibold text-sm">Admin Fəaliyyət Jurnalı</h3>
               </div>
+
+              {isActivityLogsLoading ? (
+                <div className="flex items-center justify-center py-16 text-zinc-500 text-xs gap-2">
+                  <RefreshCw className="w-4 h-4 animate-spin" />
+                  Jurnal yüklənir...
+                </div>
+              ) : isActivityLogsError ? (
+                <div className="py-10 text-center text-xs text-red-400">
+                  Fəaliyyət jurnalı yüklənə bilmədi.
+                </div>
+              ) : logs.length === 0 ? (
+                <p className="text-xs text-zinc-500 py-10 text-center">Hələ admin fəaliyyəti qeydə alınmayıb.</p>
+              ) : (
+                <div className="space-y-3 max-h-72 overflow-y-auto pr-1">
+                  {logs.map((log) => (
+                    <div
+                      key={log.id}
+                      className={`p-3 rounded-xl border ${
+                        theme === 'dark' ? 'bg-zinc-950/50 border-zinc-800' : 'bg-zinc-50 border-zinc-200'
+                      }`}
+                    >
+                      <div className="flex items-center justify-between gap-2 mb-1">
+                        <p className="text-xs font-bold text-red-400">@{log.adminUsername}</p>
+                        <span className="text-[10px] text-zinc-500 shrink-0">{formatAdminDate(log.createdAt)}</span>
+                      </div>
+                      <p className="text-[11px] font-semibold">{log.action}</p>
+                      <p className="text-[10px] text-zinc-500 mt-1">{log.description}</p>
+                    </div>
+                  ))}
+                </div>
+              )}
             </div>
           </div>
-        </div>
-      )}
-
-      {/* API Feedback Alert */}
-      {apiMessage && (
-        <div className={`p-4 rounded-2xl border flex items-center justify-between text-xs font-semibold animate-fade-in ${
-          apiMessage.type === 'success'
-            ? 'bg-emerald-500/10 border-emerald-500/20 text-emerald-400'
-            : 'bg-red-500/10 border-red-500/20 text-red-400'
-        }`}>
-          <div className="flex items-center gap-2">
-            <AlertCircle className="w-4 h-4 shrink-0" />
-            <span>{apiMessage.text}</span>
-          </div>
-          <button onClick={() => setApiMessage(null)} className="text-zinc-400 hover:text-white text-xs font-mono">✕</button>
         </div>
       )}
 
@@ -2003,13 +2471,63 @@ export default function AdminPanel({
                   </button>
                 </form>
 
+                {Array.isArray(tmdbResults) && tmdbResults.length > 0 && (
+                  <div className="mt-3 flex flex-wrap items-center gap-2">
+                    <button
+                      type="button"
+                      onClick={() => setSelectedTmdbIds(tmdbResults.map((item: any) => item.id))}
+                      className="px-3 py-1.5 rounded-lg text-[10px] font-bold bg-zinc-800 text-zinc-300 hover:text-white cursor-pointer"
+                    >
+                      Hamısını seç
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setSelectedTmdbIds([])}
+                      className="px-3 py-1.5 rounded-lg text-[10px] font-bold bg-zinc-800 text-zinc-300 hover:text-white cursor-pointer"
+                    >
+                      Seçimi təmizlə
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => void handleBulkImportTmdb()}
+                      disabled={selectedTmdbIds.length === 0 || tmdbBulkProgress?.running}
+                      className="px-3 py-1.5 rounded-lg text-[10px] font-bold bg-red-600 hover:bg-red-500 text-white cursor-pointer disabled:opacity-50 flex items-center gap-1"
+                    >
+                      <Download className="w-3 h-3" />
+                      Seçilənləri idxal et ({selectedTmdbIds.length})
+                    </button>
+                    {tmdbBulkProgress && (
+                      <div className="flex-1 min-w-[180px]">
+                        <div className={`h-2 rounded-full overflow-hidden ${theme === 'dark' ? 'bg-zinc-800' : 'bg-zinc-200'}`}>
+                          <div
+                            className="h-full bg-red-500 transition-all"
+                            style={{ width: `${(tmdbBulkProgress.current / Math.max(tmdbBulkProgress.total, 1)) * 100}%` }}
+                          />
+                        </div>
+                        <p className="text-[9px] text-zinc-500 mt-1 font-mono">
+                          {tmdbBulkProgress.running
+                            ? `Idxal edilir... ${tmdbBulkProgress.current}/${tmdbBulkProgress.total}`
+                            : `Tamamlandı ${tmdbBulkProgress.current}/${tmdbBulkProgress.total}`}
+                        </p>
+                      </div>
+                    )}
+                  </div>
+                )}
+
                 {/* TMDB Results Grid */}
                 {Array.isArray(tmdbResults) && tmdbResults.length > 0 && (
                   <div className="mt-4 grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 gap-3">
                     {tmdbResults.map((item: any) => (
                       <div key={item.id} className={`p-3 rounded-xl border flex gap-3 items-center ${
                         theme === 'dark' ? 'bg-zinc-950 border-zinc-800' : 'bg-white border-zinc-200'
-                      }`}>
+                      } ${selectedTmdbIds.includes(item.id) ? 'ring-1 ring-red-500/50' : ''}`}>
+                        <input
+                          type="checkbox"
+                          checked={selectedTmdbIds.includes(item.id)}
+                          onChange={() => toggleTmdbSelection(item.id)}
+                          className="w-4 h-4 accent-red-600 shrink-0 cursor-pointer"
+                          aria-label={`${item.title} seç`}
+                        />
                         {item.poster_path ? (
                           <img src={`https://image.tmdb.org/t/p/w92${item.poster_path}`} alt={item.title} className="w-10 h-14 object-cover rounded shadow" />
                         ) : (
@@ -2121,6 +2639,28 @@ export default function AdminPanel({
       {activeTab === 'users' && (
         <div className="space-y-6">
           <h3 className="text-lg font-semibold">Qeydiyyatlı İstifadəçilər</h3>
+
+          {isAdminUsersError && (
+            <div className={`p-4 rounded-2xl border flex items-center justify-between gap-3 text-xs ${
+              theme === 'dark' ? 'bg-red-500/10 border-red-500/20 text-red-400' : 'bg-red-50 border-red-200 text-red-600'
+            }`}>
+              <div className="flex items-center gap-2">
+                <AlertCircle className="w-4 h-4 shrink-0" />
+                <span>
+                  İstifadəçilər yüklənə bilmədi
+                  {adminUsersError instanceof Error ? `: ${adminUsersError.message}` : '.'}
+                </span>
+              </div>
+              <button
+                type="button"
+                onClick={() => refetchAdminUsers()}
+                className="px-3 py-1.5 rounded-lg bg-red-500/10 hover:bg-red-500/20 font-bold transition"
+              >
+                Yenidən cəhd et
+              </button>
+            </div>
+          )}
+
           <div className="overflow-x-auto rounded-2xl border border-zinc-800/10">
             <table className="w-full text-left border-collapse">
               <thead>
@@ -2128,73 +2668,95 @@ export default function AdminPanel({
                   <th className="p-4">İstifadəçi</th>
                   <th className="p-4">E-poçt</th>
                   <th className="p-4">Rol</th>
-                  <th className="p-4">İzləyici</th>
+                  <th className="p-4">Rəylər</th>
                   <th className="p-4">Status</th>
                   <th className="p-4 text-right">Əməliyyatlar</th>
                 </tr>
               </thead>
               <tbody className="divide-y divide-zinc-800/10 text-sm">
-                {users.map(u => {
-                  const isBanned = bannedUsers.includes(u.id);
-                  return (
-                    <tr key={u.id} className="hover:bg-zinc-800/5 transition">
-                      <td className="p-4 flex items-center gap-3">
-                        <img src={u.avatar} alt={u.name} className="w-9 h-9 rounded-full object-cover" />
-                        <div>
-                          <p className="font-semibold">{u.name}</p>
-                          <p className="text-[11px] text-zinc-500">@{u.username}</p>
-                        </div>
-                      </td>
-                      <td className="p-4 font-mono text-xs">{u.email}</td>
-                      <td className="p-4">
-                        <span className={`px-2 py-0.5 rounded text-[10px] font-bold uppercase ${
-                          u.role === 'admin' ? 'bg-red-500/10 text-red-500' : 'bg-indigo-500/10 text-indigo-500'
-                        }`}>
-                          {u.role}
-                        </span>
-                      </td>
-                      <td className="p-4 font-mono">{u.followersCount}</td>
-                      <td className="p-4">
-                        {isBanned ? (
-                          <span className="flex items-center gap-1 text-red-500 text-xs font-semibold">
-                            <Ban className="w-3.5 h-3.5" /> Bloklanıb
+                {isAdminUsersLoading ? (
+                  <tr>
+                    <td colSpan={6} className="p-8 text-center text-zinc-500 text-xs">
+                      <RefreshCw className="w-4 h-4 animate-spin inline-block mr-2" />
+                      İstifadəçilər yüklənir...
+                    </td>
+                  </tr>
+                ) : adminUsers.length === 0 ? (
+                  <tr>
+                    <td colSpan={6} className="p-8 text-center text-zinc-500 text-xs">
+                      İstifadəçi tapılmadı.
+                    </td>
+                  </tr>
+                ) : (
+                  adminUsers.map((u) => {
+                    const roleLabel = getAdminUserRoleLabel(u.roles);
+                    return (
+                      <tr key={u.id} className="hover:bg-zinc-800/5 transition">
+                        <td className="p-4 flex items-center gap-3">
+                          <img
+                            src={u.avatar || 'https://images.unsplash.com/photo-1535713875002-d1d0cf377fde?w=100&auto=format&fit=crop&q=80'}
+                            alt={u.username}
+                            className="w-9 h-9 rounded-full object-cover"
+                          />
+                          <div>
+                            <p className="font-semibold">{u.username}</p>
+                            <p className="text-[11px] text-zinc-500">@{u.username}</p>
+                          </div>
+                        </td>
+                        <td className="p-4 font-mono text-xs">{u.email}</td>
+                        <td className="p-4">
+                          <span className={`px-2 py-0.5 rounded text-[10px] font-bold uppercase ${
+                            roleLabel === 'admin' ? 'bg-red-500/10 text-red-500' : 'bg-indigo-500/10 text-indigo-500'
+                          }`}>
+                            {roleLabel}
                           </span>
-                        ) : (
-                          <span className="flex items-center gap-1 text-emerald-500 text-xs font-semibold">
-                            <CheckCircle className="w-3.5 h-3.5" /> Aktiv
-                          </span>
-                        )}
-                      </td>
-                      <td className="p-4 text-right">
-                        <div className="flex justify-end gap-2">
-                          <button
-                            onClick={() => toggleUserRole(u.id)}
-                            className="p-1.5 rounded-lg hover:bg-amber-500/10 text-amber-500 transition text-xs font-medium cursor-pointer"
-                            title="Rolunu Dəyiş"
-                          >
-                            Rolu Dəyiş
-                          </button>
-                          <button
-                            onClick={() => toggleBanUser(u.id)}
-                            className={`p-1.5 rounded-lg transition text-xs font-medium cursor-pointer ${
-                              isBanned ? 'hover:bg-green-500/10 text-green-500' : 'hover:bg-amber-500/10 text-amber-500'
-                            }`}
-                            title={isBanned ? 'Blokdan çıxart' : 'Blokla'}
-                          >
-                            {isBanned ? 'Blokdan Çıxart' : 'Blokla'}
-                          </button>
-                          <button
-                            onClick={() => handleDeleteUser(u.id)}
-                            className="p-1.5 rounded-lg hover:bg-red-500/10 text-red-500 transition cursor-pointer"
-                            title="Sil"
-                          >
-                            <Trash2 className="w-4 h-4" />
-                          </button>
-                        </div>
-                      </td>
-                    </tr>
-                  );
-                })}
+                        </td>
+                        <td className="p-4 font-mono">{u.reviewCount}</td>
+                        <td className="p-4">
+                          {u.isBanned ? (
+                            <span className="flex items-center gap-1 text-red-500 text-xs font-semibold">
+                              <Ban className="w-3.5 h-3.5" /> Bloklanıb
+                            </span>
+                          ) : (
+                            <span className="flex items-center gap-1 text-emerald-500 text-xs font-semibold">
+                              <CheckCircle className="w-3.5 h-3.5" /> Aktiv
+                            </span>
+                          )}
+                        </td>
+                        <td className="p-4 text-right">
+                          <div className="flex justify-end gap-2">
+                            <button
+                              onClick={() => toggleUserRole(u.id)}
+                              disabled={updateRolesMutation.isPending}
+                              className="p-1.5 rounded-lg hover:bg-amber-500/10 text-amber-500 transition text-xs font-medium cursor-pointer disabled:opacity-50"
+                              title="Rolunu Dəyiş"
+                            >
+                              Rolu Dəyiş
+                            </button>
+                            <button
+                              onClick={() => toggleBanUser(u.id)}
+                              disabled={toggleBanMutation.isPending}
+                              className={`p-1.5 rounded-lg transition text-xs font-medium cursor-pointer disabled:opacity-50 ${
+                                u.isBanned ? 'hover:bg-green-500/10 text-green-500' : 'hover:bg-amber-500/10 text-amber-500'
+                              }`}
+                              title={u.isBanned ? 'Blokdan çıxart' : 'Blokla'}
+                            >
+                              {u.isBanned ? 'Blokdan Çıxart' : 'Blokla'}
+                            </button>
+                            <button
+                              onClick={() => handleDeleteUser(u.id)}
+                              disabled={deleteUserMutation.isPending}
+                              className="p-1.5 rounded-lg hover:bg-red-500/10 text-red-500 transition cursor-pointer disabled:opacity-50"
+                              title="Sil"
+                            >
+                              <Trash2 className="w-4 h-4" />
+                            </button>
+                          </div>
+                        </td>
+                      </tr>
+                    );
+                  })
+                )}
               </tbody>
             </table>
           </div>
@@ -2679,15 +3241,73 @@ export default function AdminPanel({
                   </button>
                 </form>
 
+                {Array.isArray(googleBooksResults) && googleBooksResults.length > 0 && (
+                  <div className="mt-3 flex flex-wrap items-center gap-2">
+                    <button
+                      type="button"
+                      onClick={() => {
+                        const ids = googleBooksResults.map((item: any) =>
+                          item.id ?? item.googleBooksId ?? item.GoogleBooksId,
+                        ).filter(Boolean);
+                        setSelectedGoogleBookIds(ids);
+                      }}
+                      className="px-3 py-1.5 rounded-lg text-[10px] font-bold bg-zinc-800 text-zinc-300 hover:text-white cursor-pointer"
+                    >
+                      Hamısını seç
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setSelectedGoogleBookIds([])}
+                      className="px-3 py-1.5 rounded-lg text-[10px] font-bold bg-zinc-800 text-zinc-300 hover:text-white cursor-pointer"
+                    >
+                      Seçimi təmizlə
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => void handleGoogleBooksQueueImport()}
+                      disabled={selectedGoogleBookIds.length === 0 || googleBooksQueueProgress?.running}
+                      className="px-3 py-1.5 rounded-lg text-[10px] font-bold bg-indigo-600 hover:bg-indigo-500 text-white cursor-pointer disabled:opacity-50 flex items-center gap-1"
+                    >
+                      <Download className="w-3 h-3" />
+                      Növbəyə əlavə et ({selectedGoogleBookIds.length})
+                    </button>
+                    {googleBooksQueueProgress && (
+                      <div className="flex-1 min-w-[200px]">
+                        <div className={`h-2 rounded-full overflow-hidden ${theme === 'dark' ? 'bg-zinc-800' : 'bg-zinc-200'}`}>
+                          <div
+                            className="h-full bg-indigo-500 transition-all"
+                            style={{
+                              width: `${(googleBooksQueueProgress.current / Math.max(googleBooksQueueProgress.total, 1)) * 100}%`,
+                            }}
+                          />
+                        </div>
+                        <p className="text-[9px] text-zinc-500 mt-1 font-mono">
+                          {googleBooksQueueProgress.running
+                            ? `Növbə: ${googleBooksQueueProgress.current}/${googleBooksQueueProgress.total} · ✓${googleBooksQueueProgress.succeeded} ✗${googleBooksQueueProgress.failed}`
+                            : `Bitdi: ${googleBooksQueueProgress.succeeded} uğurlu, ${googleBooksQueueProgress.failed} uğursuz`}
+                        </p>
+                      </div>
+                    )}
+                  </div>
+                )}
+
                 {/* Google Books Results Grid */}
                 {Array.isArray(googleBooksResults) && googleBooksResults.length > 0 && (
                   <div className="mt-4 grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 gap-3">
                     {googleBooksResults.map((item: any) => {
                       const info = item.volumeInfo || item;
+                      const bookId = item.id ?? item.googleBooksId ?? item.GoogleBooksId;
                       return (
-                        <div key={item.id} className={`p-3 rounded-xl border flex gap-3 items-center ${
+                        <div key={bookId} className={`p-3 rounded-xl border flex gap-3 items-center ${
                           theme === 'dark' ? 'bg-zinc-950 border-zinc-800' : 'bg-white border-zinc-200'
-                        }`}>
+                        } ${selectedGoogleBookIds.includes(bookId) ? 'ring-1 ring-indigo-500/50' : ''}`}>
+                          <input
+                            type="checkbox"
+                            checked={selectedGoogleBookIds.includes(bookId)}
+                            onChange={() => toggleGoogleBookSelection(bookId)}
+                            className="w-4 h-4 accent-indigo-600 shrink-0 cursor-pointer"
+                            aria-label={`${info.title} seç`}
+                          />
                           {info.imageLinks?.thumbnail ? (
                             <img src={info.imageLinks.thumbnail} alt={info.title} className="w-10 h-14 object-cover rounded shadow" />
                           ) : (
@@ -2699,12 +3319,12 @@ export default function AdminPanel({
                             <p className="text-[10px] text-indigo-400 font-bold mt-0.5">{info.pageCount ? `${info.pageCount} səh.` : ''}</p>
                           </div>
                           <button
-                            onClick={() => handleImportGoogleBook(item.id)}
-                            disabled={importingGoogleBooksId === item.id}
+                            onClick={() => handleImportGoogleBook(bookId)}
+                            disabled={importingGoogleBooksId === bookId}
                             className="p-2 bg-indigo-600/20 hover:bg-indigo-600 text-indigo-400 hover:text-white rounded-lg transition text-[10px] font-bold shrink-0 cursor-pointer flex items-center gap-1"
                             title="İdxal Et"
                           >
-                            {importingGoogleBooksId === item.id ? <RefreshCw className="w-3 h-3 animate-spin" /> : <Download className="w-3 h-3" />}
+                            {importingGoogleBooksId === bookId ? <RefreshCw className="w-3 h-3 animate-spin" /> : <Download className="w-3 h-3" />}
                           </button>
                         </div>
                       );
@@ -2756,6 +3376,10 @@ export default function AdminPanel({
                                 {b.pdfUrl ? (
                                   <span className="inline-flex items-center gap-1 mt-1 px-2 py-0.5 rounded-md bg-red-500/15 text-red-400 border border-red-500/25 text-[10px] font-mono font-bold">
                                     <FileText className="w-3 h-3" /> PDF Sənədi Var
+                                  </span>
+                                ) : b.downloadUrl ? (
+                                  <span className="inline-flex items-center gap-1 mt-1 px-2 py-0.5 rounded-md bg-amber-500/15 text-amber-400 border border-amber-500/25 text-[10px] font-mono font-bold">
+                                    Google Ön Baxış
                                   </span>
                                 ) : (
                                   <span className="inline-flex items-center gap-1 mt-1 px-2 py-0.5 rounded-md bg-zinc-800/60 text-zinc-400 text-[10px] font-mono">
@@ -2907,17 +3531,41 @@ export default function AdminPanel({
                         )}
                       </td>
                       <td className="p-4 text-right">
-                        <button
-                          onClick={() => handleToggleLiveStream(stream.id || stream.channelKey, !!stream.isLive)}
-                          className={`px-3 py-1.5 rounded-xl font-bold text-xs transition cursor-pointer flex items-center gap-1.5 ml-auto shadow-sm ${
-                            stream.isLive
-                              ? 'bg-zinc-800 hover:bg-zinc-700 text-amber-400 border border-amber-500/30'
-                              : 'bg-red-600 hover:bg-red-500 text-white shadow-red-600/20'
-                          }`}
-                        >
-                          <Power className="w-3.5 h-3.5" />
-                          {stream.isLive ? 'Yayımı Dayandır' : 'Yayımı Başlat'}
-                        </button>
+                        <div className="flex items-center justify-end gap-2">
+                          <button
+                            onClick={() => openEditLiveStream(stream)}
+                            className={`p-2 rounded-xl transition cursor-pointer ${
+                              theme === 'dark'
+                                ? 'bg-zinc-800 hover:bg-zinc-700 text-cyan-400 border border-zinc-700'
+                                : 'bg-zinc-100 hover:bg-zinc-200 text-cyan-600 border border-zinc-200'
+                            }`}
+                            title="Redaktə et"
+                          >
+                            <Edit3 className="w-3.5 h-3.5" />
+                          </button>
+                          <button
+                            onClick={() => handleDeleteLiveStream(stream.id || stream.channelKey)}
+                            className={`p-2 rounded-xl transition cursor-pointer ${
+                              theme === 'dark'
+                                ? 'bg-zinc-800 hover:bg-red-600/80 text-red-400 hover:text-white border border-zinc-700'
+                                : 'bg-zinc-100 hover:bg-red-100 text-red-600 border border-zinc-200'
+                            }`}
+                            title="Sil"
+                          >
+                            <Trash2 className="w-3.5 h-3.5" />
+                          </button>
+                          <button
+                            onClick={() => handleToggleLiveStream(stream.id || stream.channelKey, !!stream.isLive)}
+                            className={`px-3 py-1.5 rounded-xl font-bold text-xs transition cursor-pointer flex items-center gap-1.5 shadow-sm ${
+                              stream.isLive
+                                ? 'bg-zinc-800 hover:bg-zinc-700 text-amber-400 border border-amber-500/30'
+                                : 'bg-red-600 hover:bg-red-500 text-white shadow-red-600/20'
+                            }`}
+                          >
+                            <Power className="w-3.5 h-3.5" />
+                            {stream.isLive ? 'Dayandır' : 'Başlat'}
+                          </button>
+                        </div>
                       </td>
                     </tr>
                   ))
@@ -2925,6 +3573,129 @@ export default function AdminPanel({
               </tbody>
             </table>
           </div>
+
+          {editingLiveStreamId && (
+            <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/70 backdrop-blur-sm">
+              <div className={`w-full max-w-2xl rounded-3xl border shadow-2xl ${
+                theme === 'dark' ? 'bg-zinc-900 border-zinc-800' : 'bg-white border-zinc-200'
+              }`}>
+                <div className={`flex items-center justify-between p-5 border-b ${
+                  theme === 'dark' ? 'border-zinc-800' : 'border-zinc-100'
+                }`}>
+                  <div>
+                    <h3 className="text-sm font-bold flex items-center gap-2">
+                      <Edit3 className="w-4 h-4 text-cyan-400" />
+                      Canlı Yayım Kanalını Redaktə Et
+                    </h3>
+                    <p className="text-[10px] text-zinc-500 mt-1 font-mono">PUT /api/livestreams/admin/{editingLiveStreamId}</p>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => setEditingLiveStreamId(null)}
+                    className="p-2 rounded-xl hover:bg-zinc-800 text-zinc-400 hover:text-white transition cursor-pointer"
+                  >
+                    <X className="w-4 h-4" />
+                  </button>
+                </div>
+
+                <form onSubmit={handleUpdateLiveStream} className="p-5 space-y-4 max-h-[70vh] overflow-y-auto">
+                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                    <div>
+                      <label className="block text-xs font-bold text-zinc-300 mb-1.5">ChannelKey <span className="text-red-500">*</span></label>
+                      <input
+                        type="text"
+                        required
+                        value={editLiveStream.channelKey}
+                        onChange={e => setEditLiveStream(prev => ({ ...prev, channelKey: e.target.value }))}
+                        className="w-full px-4 py-2.5 bg-zinc-950 border border-zinc-800 rounded-xl text-xs font-mono text-cyan-400 focus:outline-none focus:ring-2 focus:ring-red-500/50"
+                      />
+                    </div>
+                    <div>
+                      <label className="block text-xs font-bold text-zinc-300 mb-1.5">Kateqoriya <span className="text-red-500">*</span></label>
+                      <input
+                        type="text"
+                        required
+                        value={editLiveStream.category}
+                        onChange={e => setEditLiveStream(prev => ({ ...prev, category: e.target.value }))}
+                        className="w-full px-4 py-2.5 bg-zinc-950 border border-zinc-800 rounded-xl text-xs text-white focus:outline-none focus:ring-2 focus:ring-red-500/50"
+                      />
+                    </div>
+                  </div>
+
+                  <div>
+                    <label className="block text-xs font-bold text-zinc-300 mb-1.5">Başlıq <span className="text-red-500">*</span></label>
+                    <input
+                      type="text"
+                      required
+                      value={editLiveStream.title}
+                      onChange={e => setEditLiveStream(prev => ({ ...prev, title: e.target.value }))}
+                      className="w-full px-4 py-2.5 bg-zinc-950 border border-zinc-800 rounded-xl text-xs text-white focus:outline-none focus:ring-2 focus:ring-red-500/50"
+                    />
+                  </div>
+
+                  <div>
+                    <label className="block text-xs font-bold text-zinc-300 mb-1.5">Təsvir</label>
+                    <textarea
+                      rows={3}
+                      value={editLiveStream.description}
+                      onChange={e => setEditLiveStream(prev => ({ ...prev, description: e.target.value }))}
+                      className="w-full px-4 py-2.5 bg-zinc-950 border border-zinc-800 rounded-xl text-xs text-white focus:outline-none focus:ring-2 focus:ring-red-500/50"
+                    />
+                  </div>
+
+                  <div>
+                    <label className="block text-xs font-bold text-zinc-300 mb-1.5">StreamUrl <span className="text-red-500">*</span></label>
+                    <input
+                      type="text"
+                      required
+                      value={editLiveStream.streamUrl}
+                      onChange={e => setEditLiveStream(prev => ({ ...prev, streamUrl: e.target.value }))}
+                      className="w-full px-4 py-2.5 bg-zinc-950 border border-zinc-800 rounded-xl text-xs font-mono text-cyan-300 focus:outline-none focus:ring-2 focus:ring-red-500/50"
+                    />
+                  </div>
+
+                  <div>
+                    <label className="block text-xs font-bold text-zinc-300 mb-1.5">ThumbnailUrl</label>
+                    <input
+                      type="text"
+                      value={editLiveStream.thumbnailUrl}
+                      onChange={e => setEditLiveStream(prev => ({ ...prev, thumbnailUrl: e.target.value }))}
+                      className="w-full px-4 py-2.5 bg-zinc-950 border border-zinc-800 rounded-xl text-xs text-zinc-300 focus:outline-none focus:ring-2 focus:ring-red-500/50"
+                    />
+                  </div>
+
+                  <div className={`flex items-center justify-end gap-3 pt-4 border-t ${
+                    theme === 'dark' ? 'border-zinc-800' : 'border-zinc-100'
+                  }`}>
+                    <button
+                      type="button"
+                      onClick={() => setEditingLiveStreamId(null)}
+                      className="px-4 py-2.5 rounded-xl text-xs font-bold bg-zinc-800 hover:bg-zinc-700 text-zinc-300 transition cursor-pointer"
+                    >
+                      Ləğv et
+                    </button>
+                    <button
+                      type="submit"
+                      disabled={isSubmittingLiveStreamEdit}
+                      className="inline-flex items-center gap-2 px-6 py-2.5 rounded-xl text-xs font-bold bg-cyan-600 hover:bg-cyan-500 text-white transition cursor-pointer disabled:opacity-50"
+                    >
+                      {isSubmittingLiveStreamEdit ? (
+                        <>
+                          <RefreshCw className="w-4 h-4 animate-spin" />
+                          Yenilənir...
+                        </>
+                      ) : (
+                        <>
+                          <CheckCircle className="w-4 h-4" />
+                          Yeniləmələri Yadda Saxla
+                        </>
+                      )}
+                    </button>
+                  </div>
+                </form>
+              </div>
+            </div>
+          )}
         </div>
       )}
 
@@ -3171,6 +3942,14 @@ export default function AdminPanel({
             </table>
           </div>
         </div>
+      )}
+
+      {activeTab === 'analytics' && (
+        <AdminAnalyticsModeration mode="analytics" theme={theme} formatAdminDate={formatAdminDate} />
+      )}
+
+      {activeTab === 'moderation' && (
+        <AdminAnalyticsModeration mode="moderation" theme={theme} formatAdminDate={formatAdminDate} />
       )}
     </div>
   );

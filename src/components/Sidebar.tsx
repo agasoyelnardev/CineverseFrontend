@@ -1,5 +1,5 @@
 import React from 'react';
-import { Home, Film, Users, MessageSquare, Heart, Bookmark, User as UserIcon, Shield, X, Sparkles, Radio, ListPlus, BookOpen, UserPlus } from 'lucide-react';
+import { Home, Film, Users, MessageSquare, Heart, Bookmark, User as UserIcon, Shield, X, Sparkles, Radio, ListPlus, BookOpen, UserPlus, Clock } from 'lucide-react';
 import { User } from '../types';
 import DigitalClock from './DigitalClock';
 
@@ -38,6 +38,7 @@ export default function Sidebar({
   const personalMenu = [
     { id: 'favorites', label: 'Sevimlilər', icon: Heart },
     { id: 'watchlist', label: 'İzləmə Siyahısı', icon: Bookmark },
+    { id: 'watch-history', label: 'İzləmə Tarixi', icon: Clock },
     { id: 'shared-playlists', label: 'Ortaq Pleylistlər', icon: ListPlus },
     { id: 'profile', label: 'Profilim', icon: UserIcon },
   ];

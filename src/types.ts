@@ -59,6 +59,7 @@ export interface User {
   readingLists?: { id: string; name: string; books: string[] }[];
   bookVotes?: { [adaptationId: string]: 'book' | 'movie' }; // adaptationId -> choice
   points?: number; // Kino Xalları
+  badge?: string; // Backend-dən gələn rütbə nişanı
   notifications?: Notification[];
 }
 
@@ -72,11 +73,14 @@ export interface Collection {
   likesCount: number;
   movies: string[]; // movie IDs
   isSaved?: boolean;
+  isLikedByCurrentUser?: boolean;
+  movieCount?: number;
 }
 
 export interface ChatMessage {
   id: string;
   sender: string;
+  senderId?: string;
   senderAvatar: string;
   message: string;
   timestamp: string;
@@ -94,10 +98,20 @@ export interface WatchParty {
   roomName: string;
   movieId: string;
   creator: string;
+  creatorId?: string;
   participants: Participant[];
   currentTimestamp: number; // in seconds
   isPlaying: boolean;
   chat: ChatMessage[];
+  viewerCount?: number;
+  streamUrl?: string;
+  movieTitle?: string;
+  movieDescription?: string;
+  moviePoster?: string;
+  movieVideoUrl?: string;
+  isPrivate?: boolean;
+  isPremium?: boolean;
+  inviteToken?: string;
 }
 
 export interface Comment {
@@ -179,6 +193,7 @@ export interface Book {
   isTrending?: boolean;
   isTopRated?: boolean;
   isNewRelease?: boolean;
+  isLikedByCurrentUser?: boolean;
 }
 
 export interface BookCollection {
@@ -190,6 +205,9 @@ export interface BookCollection {
   userId?: string;
   author?: string;
   authorAvatar?: string;
+  likesCount?: number;
+  isLikedByCurrentUser?: boolean;
+  isSaved?: boolean;
 }
 
 export interface BookVsMovie {

@@ -4,8 +4,62 @@ import {
   RefreshCw, LogOut, Heart, Flame, MessageSquare, ThumbsUp, Sparkles, 
   Popcorn, Share2, Copy, Check, Image, Search, Plus, X, UserPlus, Edit3, Trash2, Crown
 } from 'lucide-react';
-import { WatchParty, Movie, User } from '../types';
-import { apiUpdateChatMessage, apiDeleteChatMessage, apiTransferHost } from '../api';
+import {
+  isDirectVideoUrl,
+  isNonEmbeddablePageUrl,
+  normalizeMediaUrl,
+  resolveWatchPartyMediaSource,
+} from '../utils/mediaUrl';
+import { resolvePartyMovie } from '../utils/watchPartyMovie';
+import { isBackendRoomId } from '../utils/watchPartyRoom';
+import { getWatchPartyUrl } from '../utils/watchPartyUrl';
+import { WatchParty, Movie, User, Participant } from '../types';
+import { apiUpdateChatMessage, apiDeleteChatMessage, apiTransferHost, apiGetRoomMessages, apiGetUserProfile, apiGetRoomById } from '../api';
+import {
+  joinChatRoom,
+  leaveChatRoom,
+  sendChatMessage,
+  sendPlaybackControl,
+  sendChatReaction,
+  onReceiveChatReaction,
+  offReceiveChatReaction,
+  onChatMessageReceived,
+  offChatMessageReceived,
+  onChatMessageUpdated,
+  offChatMessageUpdated,
+  onChatMessageDeleted,
+  offChatMessageDeleted,
+  onHostChanged,
+  offHostChanged,
+  onPlaybackSync,
+  offPlaybackSync,
+  onViewerCountChanged,
+  offViewerCountChanged,
+  onParticipantsChanged,
+  offParticipantsChanged,
+  type ChatMessageReceivedPayload,
+  type ChatMessageUpdatedPayload,
+  type ChatMessageDeletedPayload,
+  type ParticipantsChangedPayload,
+  type ChatReactionPayload,
+} from '../signalr';
+import toast from 'react-hot-toast';
+import { normalizeEntityId } from '../utils/entityIds';
+import {
+  isRoomHost,
+  isOwnChatMessage,
+  isUuidLike,
+  mapRoomChatMessage,
+  resolveLocalUsername,
+  resolveChatAvatar,
+  coalesceAvatar,
+  DEFAULT_CHAT_AVATAR,
+} from '../utils/watchPartyUtils';
+
+// Backend ChatMessageDto/SignalR payload -> UI-nin gözlədiyi party.chat mesaj formatına çevirir
+function mapChatMessage(m: ChatMessageReceivedPayload | Record<string, unknown>) {
+  return mapRoomChatMessage(m as Record<string, unknown>);
+}
 
 // Helper to parse duration string like "2saat 49dəq" or "120 min" into total seconds
 function parseDurationToSeconds(durationStr?: string): number {
@@ -75,6 +129,62 @@ const MOVIE_STICKERS = [
   { id: 'st12', emoji: '🚀', text: 'Gələcəyə Səyahət', bg: 'bg-cyan-500/10 border-cyan-500/20 text-cyan-400' }
 ];
 
+const DEFAULT_PARTICIPANT_AVATAR = DEFAULT_CHAT_AVATAR;
+
+function normalizeParticipantsPayload(payload: ParticipantsChangedPayload & { Count?: number; UserIds?: string[] }) {
+  return {
+    count: payload.count ?? payload.Count ?? 0,
+    userIds: payload.userIds ?? payload.UserIds ?? [],
+  };
+}
+
+async function resolveParticipantsFromIds(
+  userIds: string[],
+  directory: User[],
+  currentUser: User,
+  profileCache: Map<string, { name: string; avatar: string; username: string }>,
+): Promise<Participant[]> {
+  const lookup = new Map<string, User>();
+  for (const user of directory) lookup.set(user.id, user);
+  lookup.set(currentUser.id, currentUser);
+
+  const resolved: Participant[] = [];
+
+  for (const id of userIds) {
+    const known = lookup.get(id);
+    if (known) {
+      resolved.push({
+        id: known.id,
+        name: known.name,
+        avatar: known.avatar || DEFAULT_PARTICIPANT_AVATAR,
+      });
+      continue;
+    }
+
+    const cached = profileCache.get(id);
+    if (cached) {
+      resolved.push({
+        id,
+        name: cached.name,
+        avatar: cached.avatar,
+      });
+      continue;
+    }
+
+    try {
+      const profile = await apiGetUserProfile(id);
+      const name = profile.fullName || profile.userName || 'İzləyici';
+      const avatar = profile.avatar || DEFAULT_PARTICIPANT_AVATAR;
+      profileCache.set(id, { name, avatar, username: profile.userName });
+      resolved.push({ id, name, avatar });
+    } catch {
+      resolved.push({ id, name: 'İzləyici', avatar: DEFAULT_PARTICIPANT_AVATAR });
+    }
+  }
+
+  return resolved;
+}
+
 interface WatchPartyRoomProps {
   party: WatchParty;
   currentUser: User;
@@ -95,24 +205,49 @@ interface FloatingEmoji {
   left: number;
 }
 
+const REACTION_EMOJI_MAP: Record<string, 'heart' | 'fire' | 'clap'> = {
+  '❤️': 'heart',
+  '🔥': 'fire',
+  '👍': 'clap',
+};
+
+const REACTION_DISPLAY: Record<'heart' | 'fire' | 'clap', string> = {
+  heart: '❤️',
+  fire: '🔥',
+  clap: '👍',
+};
+
+function addFloatingEmoji(
+  emoji: string,
+  setFloatingEmojis: React.Dispatch<React.SetStateAction<FloatingEmoji[]>>,
+) {
+  const newEmoji: FloatingEmoji = {
+    id: 'emoji_' + Math.random(),
+    emoji,
+    left: Math.random() * 80 + 10,
+  };
+  setFloatingEmojis((prev) => [...prev, newEmoji]);
+  setTimeout(() => {
+    setFloatingEmojis((prev) => prev.filter((e) => e.id !== newEmoji.id));
+  }, 3000);
+}
+
 // Smart Helper to detect and convert video links into embeddable player URLs
 function getEmbedUrl(url: string): { embedUrl: string; isEmbeddable: boolean; isDirectVideo: boolean; reason?: string } {
   if (!url) return { embedUrl: '', isEmbeddable: false, isDirectVideo: false };
 
-  const trimmed = url.trim();
+  const trimmed = normalizeMediaUrl(url);
+  if (!trimmed) return { embedUrl: '', isEmbeddable: false, isDirectVideo: false };
 
-  // Direct video file (.mp4, .webm, .m3u8)
-  if (trimmed.match(/\.(mp4|webm|m3u8)(\?.*)?$/i)) {
+  if (isDirectVideoUrl(trimmed)) {
     return { embedUrl: trimmed, isEmbeddable: true, isDirectVideo: true };
   }
 
-  // YouTube match: watch?v=ID or youtu.be/ID or youtube.com/embed/ID
-  const ytRegExp = /^.*(youtu.be\/|v\/|u\/\w\/|embed\/|watch\?v=|\&v=)([^#\&\?]*).*/;
-  const ytMatch = trimmed.match(ytRegExp);
-  if (ytMatch && ytMatch[2] && ytMatch[2].length === 11) {
-    const videoId = ytMatch[2];
+  const youtubeId = trimmed.match(/^.*(youtu.be\/|v\/|u\/\w\/|embed\/|watch\?v=|\&v=)([^#\&\?]*).*/)?.[2];
+  if (youtubeId && youtubeId.length === 11) {
+    const origin = typeof window !== 'undefined' ? encodeURIComponent(window.location.origin) : '';
     return {
-      embedUrl: `https://www.youtube.com/embed/${videoId}?autoplay=1&enablejsapi=1&rel=0&controls=1`,
+      embedUrl: `https://www.youtube-nocookie.com/embed/${youtubeId}?autoplay=1&enablejsapi=1&rel=0&controls=1&modestbranding=1&playsinline=1&origin=${origin}`,
       isEmbeddable: true,
       isDirectVideo: false,
     };
@@ -150,14 +285,17 @@ function getEmbedUrl(url: string): { embedUrl: string; isEmbeddable: boolean; is
     };
   }
 
-  // Default fallback
-  let srcUrl = trimmed;
-  if (!srcUrl.includes('?')) {
-    srcUrl += '?autoplay=1&mute=0';
-  } else if (!srcUrl.includes('autoplay=')) {
-    srcUrl += '&autoplay=1&mute=0';
+  // Default fallback — don't iframe random pages (TMDB, search, etc.)
+  if (isNonEmbeddablePageUrl(trimmed)) {
+    return {
+      embedUrl: trimmed,
+      isEmbeddable: false,
+      isDirectVideo: false,
+      reason: 'Bu link birbaşa pleyer deyil. YouTube və ya MP4 linki istifadə edin.',
+    };
   }
-  return { embedUrl: srcUrl, isEmbeddable: true, isDirectVideo: false };
+
+  return { embedUrl: trimmed, isEmbeddable: false, isDirectVideo: false, reason: 'Bu link otaqda birbaşa açıla bilmir.' };
 }
 
 export default function WatchPartyRoom({
@@ -175,6 +313,7 @@ export default function WatchPartyRoom({
 }: WatchPartyRoomProps) {
   const [messageText, setMessageText] = useState('');
   const [floatingEmojis, setFloatingEmojis] = useState<FloatingEmoji[]>([]);
+  const [shareInviteToken, setShareInviteToken] = useState<string | undefined>(party.inviteToken);
   const [syncStatus, setSyncStatus] = useState<string>('Sinxronizasiya tamamlandı.');
   const [showShareModal, setShowShareModal] = useState(false);
   const [showQuickInviteModal, setShowQuickInviteModal] = useState(false);
@@ -182,40 +321,293 @@ export default function WatchPartyRoom({
   const [invitedIds, setInvitedIds] = useState<string[]>([]);
   const [copied, setCopied] = useState(false);
   const [showMediaPicker, setShowMediaPicker] = useState(false);
+  const [forceDirectVideo, setForceDirectVideo] = useState(false);
   const [pickerTab, setPickerTab] = useState<'gif' | 'sticker'>('gif');
   const [gifSearchQuery, setGifSearchQuery] = useState('');
   const [editingMsgId, setEditingMsgId] = useState<string | null>(null);
   const [editingMsgText, setEditingMsgText] = useState('');
   const chatEndRef = useRef<HTMLDivElement>(null);
+  const partyRef = useRef(party);
+  partyRef.current = party;
+  const participantProfileCacheRef = useRef(new Map<string, { name: string; avatar: string; username: string }>());
+  const [liveViewerCount, setLiveViewerCount] = useState<number>(party.viewerCount ?? party.participants.length);
+  const [avatarCacheTick, setAvatarCacheTick] = useState(0);
+  const hostUsername = isUuidLike(party.creator)
+    ? (resolveLocalUsername(party.creatorId ?? party.creator, users, currentUser) ?? party.creator)
+    : party.creator;
+
+  // Otaq sahibi UUID kimi gəlirsə, profil adına çevir
+  useEffect(() => {
+    const creatorKey = party.creatorId ?? (isUuidLike(party.creator) ? party.creator : null);
+    if (!creatorKey || !isUuidLike(creatorKey)) return;
+
+    const localName = resolveLocalUsername(creatorKey, users, currentUser);
+    if (localName && localName !== party.creator) {
+      onUpdateParty({ ...partyRef.current, creator: localName, creatorId: creatorKey });
+      return;
+    }
+
+    let cancelled = false;
+    (async () => {
+      try {
+        const profile = await apiGetUserProfile(creatorKey);
+        if (cancelled) return;
+        const username = profile.userName || profile.fullName || creatorKey;
+        onUpdateParty({
+          ...partyRef.current,
+          creator: username,
+          creatorId: creatorKey,
+        });
+        participantProfileCacheRef.current.set(creatorKey, {
+          name: profile.fullName || profile.userName,
+          avatar: profile.avatar,
+          username: profile.userName,
+        });
+      } catch {
+        // UUID fallback saxlanılır
+      }
+    })();
+
+    return () => {
+      cancelled = true;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [party.id, party.creator, party.creatorId, users, currentUser?.id]);
+
+  // Çat mesajlarında boş avatar varsa profil API-dən yüklə
+  useEffect(() => {
+    const senderIds = [
+      ...new Set(
+        party.chat
+          .filter((m) => m.sender !== 'Sistem' && m.senderId && !m.senderAvatar?.trim())
+          .map((m) => m.senderId as string),
+      ),
+    ].filter((id) => {
+      if (participantProfileCacheRef.current.has(id)) return false;
+      if (currentUser && normalizeEntityId(id) === normalizeEntityId(currentUser.id)) return false;
+      return !users.some(
+        (u) => normalizeEntityId(u.id) === normalizeEntityId(id) && u.avatar?.trim(),
+      );
+    });
+
+    if (senderIds.length === 0) return;
+
+    let cancelled = false;
+    (async () => {
+      for (const userId of senderIds) {
+        try {
+          const profile = await apiGetUserProfile(userId);
+          if (cancelled) return;
+          participantProfileCacheRef.current.set(userId, {
+            name: profile.fullName || profile.userName,
+            avatar: coalesceAvatar(profile.avatar),
+            username: profile.userName,
+          });
+        } catch {
+          // default avatar render-time fallback istifadə olunacaq
+        }
+      }
+      if (!cancelled) {
+        setAvatarCacheTick((n) => n + 1);
+      }
+    })();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [party.chat, party.id, users, currentUser?.id]);
+
+  // ChatHub-a qoşulma, tarixçəni yükləmə və real-time hadisələrə abunə olma
+  useEffect(() => {
+    let isCancelled = false;
+
+    if (!isBackendRoomId(party.id)) {
+      toast.error('Bu otaq backend ilə sinxron deyil.');
+      onLeave();
+      return;
+    }
+
+    (async () => {
+      try {
+        const history = await apiGetRoomMessages(party.id);
+        if (!isCancelled && Array.isArray(history)) {
+          const mapped = history.map(mapChatMessage);
+          onUpdateParty({ ...partyRef.current, chat: mapped });
+        }
+      } catch (err) {
+        console.log('Otaq mesaj tarixçəsi yüklənmə xətası:', err);
+      }
+
+      try {
+        await joinChatRoom(party.id);
+      } catch (err: any) {
+        console.error('Otağa qoşulma (SignalR) xətası:', err);
+        toast.error(err?.message || 'Məxfi otağa qoşula bilmədiniz. Dəvət almalısınız.');
+        onLeave();
+      }
+    })();
+
+    const handleIncomingMessage = (msg: ChatMessageReceivedPayload) => {
+      const mapped = mapChatMessage(msg);
+      onUpdateParty({ ...partyRef.current, chat: [...partyRef.current.chat, mapped] });
+    };
+
+    const handleMessageUpdated = (payload: ChatMessageUpdatedPayload & { MessageText?: string; Id?: string }) => {
+      const msgId = String(payload.id ?? payload.Id ?? '');
+      const messageText = payload.messageText ?? payload.MessageText ?? '';
+      onUpdateParty({
+        ...partyRef.current,
+        chat: partyRef.current.chat.map(m =>
+          m.id === msgId ? { ...m, message: messageText } : m
+        ),
+      });
+    };
+
+    const handleMessageDeleted = (payload: ChatMessageDeletedPayload & { Id?: string }) => {
+      const msgId = String(payload.id ?? payload.Id ?? '');
+      onUpdateParty({
+        ...partyRef.current,
+        chat: partyRef.current.chat.filter(m => m.id !== msgId),
+      });
+    };
+
+    const handleHostChanged = async (payload: { newHostUserId: string; NewHostUserId?: string }) => {
+      const newHostId = payload.newHostUserId ?? payload.NewHostUserId ?? '';
+      const localUser = users.find(u => normalizeEntityId(u.id) === normalizeEntityId(newHostId));
+      if (localUser) {
+        onUpdateParty({
+          ...partyRef.current,
+          creator: localUser.username,
+          creatorId: newHostId,
+        });
+        return;
+      }
+      try {
+        const profile = await apiGetUserProfile(newHostId);
+        onUpdateParty({
+          ...partyRef.current,
+          creator: profile.userName || profile.fullName || newHostId,
+          creatorId: newHostId,
+        });
+      } catch {
+        onUpdateParty({ ...partyRef.current, creatorId: newHostId });
+      }
+    };
+
+    const handlePlaybackSync = (payload: { action: string; timestamp: number }) => {
+      onUpdateParty({
+        ...partyRef.current,
+        isPlaying: payload.action === 'play',
+        currentTimestamp: payload.timestamp,
+      });
+      setCurrentTime(payload.timestamp);
+    };
+
+    const handleParticipantsChanged = async (rawPayload: ParticipantsChangedPayload & { Count?: number; UserIds?: string[] }) => {
+      const { count, userIds } = normalizeParticipantsPayload(rawPayload);
+      setLiveViewerCount(count);
+
+      const participants = await resolveParticipantsFromIds(
+        userIds,
+        users,
+        currentUser,
+        participantProfileCacheRef.current,
+      );
+
+      if (isCancelled) return;
+
+      onUpdateParty({
+        ...partyRef.current,
+        participants,
+        viewerCount: count,
+      });
+    };
+
+    onChatMessageReceived(handleIncomingMessage);
+    onChatMessageUpdated(handleMessageUpdated);
+    onChatMessageDeleted(handleMessageDeleted);
+    onHostChanged(handleHostChanged);
+    onPlaybackSync(handlePlaybackSync);
+    onViewerCountChanged((count) => {
+      setLiveViewerCount(count);
+      onUpdateParty({ ...partyRef.current, viewerCount: count });
+    });
+    onParticipantsChanged(handleParticipantsChanged);
+
+    const handleIncomingReaction = (payload: ChatReactionPayload & { ReactionType?: string; Username?: string }) => {
+      const reactionType = (payload.reactionType ?? payload.ReactionType ?? 'heart') as 'heart' | 'fire' | 'clap';
+      const emoji = REACTION_DISPLAY[reactionType] || '❤️';
+      const username = payload.username ?? payload.Username ?? 'İstifadəçi';
+      addFloatingEmoji(emoji, setFloatingEmojis);
+      onUpdateParty({
+        ...partyRef.current,
+        chat: [
+          ...partyRef.current.chat,
+          {
+            id: 'sys_reaction_' + Date.now() + Math.random(),
+            sender: 'Sistem',
+            senderAvatar: '',
+            message: `${username} reaksiya verdi: ${emoji}`,
+            timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
+          },
+        ],
+      });
+    };
+    onReceiveChatReaction(handleIncomingReaction);
+
+    return () => {
+      isCancelled = true;
+      offChatMessageReceived(handleIncomingMessage);
+      offChatMessageUpdated(handleMessageUpdated);
+      offChatMessageDeleted(handleMessageDeleted);
+      offHostChanged(handleHostChanged);
+      offPlaybackSync(handlePlaybackSync);
+      offViewerCountChanged();
+      offParticipantsChanged(handleParticipantsChanged);
+      offReceiveChatReaction(handleIncomingReaction);
+      leaveChatRoom(party.id).catch(() => {});
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [party.id]);
 
   const handleSaveEditMsg = async (msgId: string) => {
     if (!editingMsgText.trim()) return;
     const trimmed = editingMsgText.trim();
+    const previousChat = party.chat;
     const updatedChat = party.chat.map(m => m.id === msgId ? { ...m, message: trimmed } : m);
     onUpdateParty({ ...party, chat: updatedChat });
     setEditingMsgId(null);
     setEditingMsgText('');
     try {
       await apiUpdateChatMessage(msgId, trimmed);
-    } catch (err) {
+    } catch (err: any) {
       console.error('Mesaj redaktə edilərkən xəta:', err);
+      onUpdateParty({ ...party, chat: previousChat });
+      toast.error(err?.message || 'Mesaj redaktə edilə bilmədi.');
     }
   };
 
   const handleDeleteMsg = async (msgId: string) => {
+    if (!msgId) {
+      toast.error('Mesaj ID-si tapılmadı.');
+      return;
+    }
+    const previousChat = party.chat;
     const updatedChat = party.chat.filter(m => m.id !== msgId);
     onUpdateParty({ ...party, chat: updatedChat });
     try {
       await apiDeleteChatMessage(msgId);
-    } catch (err) {
+    } catch (err: any) {
       console.error('Mesaj silinərkən xəta:', err);
+      onUpdateParty({ ...party, chat: previousChat });
+      toast.error(err?.message || 'Mesaj silinə bilmədi.');
     }
   };
 
   const handleTransferHost = async (targetUserId: string, targetUsername: string) => {
     if (!window.confirm(`Host statusunu @${targetUsername} istifadəçisinə ötürmək istədiyinizdən əminsiniz?`)) return;
     
-    const updatedParty = { ...party, creator: targetUsername };
+    const updatedParty = { ...party, creator: targetUsername, creatorId: targetUserId };
     onUpdateParty(updatedParty);
 
     try {
@@ -225,7 +617,24 @@ export default function WatchPartyRoom({
     }
   };
 
-  const movie = movies.find((m) => m.id === party.movieId) || movies[0];
+  const movie = resolvePartyMovie(party, movies);
+  const mediaSource = useMemo(
+    () => resolveWatchPartyMediaSource({
+      videoUrl: movie.videoUrl,
+      externalUrl: movie.externalUrl,
+      trailerUrl: movie.trailerUrl,
+      streamUrl: party.streamUrl,
+    }),
+    [movie, party.streamUrl],
+  );
+  const activeMediaUrl = forceDirectVideo && mediaSource.fallbackUrl
+    ? mediaSource.fallbackUrl
+    : mediaSource.url;
+  const { embedUrl, isEmbeddable, isDirectVideo, reason } = getEmbedUrl(activeMediaUrl);
+
+  useEffect(() => {
+    setForceDirectVideo(false);
+  }, [movie.id, mediaSource.url]);
 
   const totalDuration = useMemo(() => parseDurationToSeconds(movie?.duration), [movie?.duration]);
   const [currentTime, setCurrentTime] = useState<number>(party.currentTimestamp ?? 2535);
@@ -268,12 +677,21 @@ export default function WatchPartyRoom({
       currentTimestamp: newTime
     };
     onUpdateParty(updatedParty);
+
+    // Yalnız host video vaxtını dəyişdirə bilər (backend PlaybackControl-u belə tələb edir)
+    if (isRoomHost(party, currentUser)) {
+      sendPlaybackControl(party.id, 'seek', newTime).catch(err =>
+        console.error('Seek sinxronizasiyası göndərilə bilmədi:', err)
+      );
+    }
   };
 
   // Helper to lookup participant Instagram-like username tag
   const getParticipantUsername = (pId: string, pName: string) => {
     const found = users.find((u) => u.id === pId);
     if (found) return found.username;
+    const cached = participantProfileCacheRef.current.get(pId);
+    if (cached?.username) return cached.username;
     // fallback clean string
     return pName.toLowerCase().replace(/[^a-z0-9_]/g, '') || 'kinoçu';
   };
@@ -317,61 +735,53 @@ export default function WatchPartyRoom({
       ]
     };
     onUpdateParty(updatedParty);
+
+    // Otağın digər üzvlərinə yayım vəziyyətini bildir (yalnız host icazəlidir)
+    if (isRoomHost(party, currentUser)) {
+      sendPlaybackControl(party.id, isPlayingNext ? 'play' : 'pause', currentTime).catch(err =>
+        console.error('Play/Pause sinxronizasiyası göndərilə bilmədi:', err)
+      );
+    }
   };
 
-  // Handle Send Message
-  const handleSendMessage = (e: React.FormEvent) => {
+  // Handle Send Message — SignalR ChatHub üzərindən real-time göndərilir,
+  // mesaj UI-a "ReceiveMessage" hadisəsi ilə geri qayıdanda əlavə olunur (bax: yuxarıdakı useEffect)
+  const handleSendMessage = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!messageText.trim()) return;
+    const trimmed = messageText.trim();
+    if (!trimmed) return;
 
-    const updatedParty: WatchParty = {
-      ...party,
-      chat: [
-        ...party.chat,
-        {
-          id: 'msg_' + Date.now(),
-          sender: currentUser.name,
-          senderAvatar: currentUser.avatar,
-          message: messageText.trim(),
-          timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
-        }
-      ]
-    };
-    onUpdateParty(updatedParty);
     setMessageText('');
+    try {
+      await sendChatMessage(party.id, trimmed);
+    } catch (err) {
+      console.error('Mesaj göndərilə bilmədi:', err);
+    }
   };
 
   // Handle Send GIF or Sticker
-  const handleSendMedia = (type: 'gif' | 'sticker', content: string) => {
+  const handleSendMedia = async (type: 'gif' | 'sticker', content: string) => {
     const mediaMessage = type === 'gif' ? `[GIF]: ${content}` : `[STICKER]: ${content}`;
-    const updatedParty: WatchParty = {
-      ...party,
-      chat: [
-        ...party.chat,
-        {
-          id: 'msg_' + Date.now(),
-          sender: currentUser.name,
-          senderAvatar: currentUser.avatar,
-          message: mediaMessage,
-          timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
-        }
-      ]
-    };
-    onUpdateParty(updatedParty);
     setShowMediaPicker(false);
+    try {
+      await sendChatMessage(party.id, mediaMessage);
+    } catch (err) {
+      console.error('GIF/Sticker göndərilə bilmədi:', err);
+    }
   };
 
-  // Trigger Emoji Reaction
+  // Trigger Emoji Reaction — ❤️🔥👍 hub vasitəsilə real-time yayımlanır
   const handleEmojiReaction = (emoji: string) => {
-    // Add floating emoji
-    const newEmoji: FloatingEmoji = {
-      id: 'emoji_' + Math.random(),
-      emoji: emoji,
-      left: Math.random() * 80 + 10 // random percentage position
-    };
-    setFloatingEmojis((prev) => [...prev, newEmoji]);
+    addFloatingEmoji(emoji, setFloatingEmojis);
 
-    // Send emoji system message
+    const reactionType = REACTION_EMOJI_MAP[emoji];
+    if (reactionType) {
+      sendChatReaction(party.id, reactionType).catch((err) => {
+        console.error('Reaksiya göndərilə bilmədi:', err);
+      });
+      return;
+    }
+
     const updatedParty: WatchParty = {
       ...party,
       chat: [
@@ -381,17 +791,34 @@ export default function WatchPartyRoom({
           sender: 'Sistem',
           senderAvatar: '',
           message: `${currentUser.name} reaksiya verdi: ${emoji}`,
-          timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
-        }
-      ]
+          timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
+        },
+      ],
     };
     onUpdateParty(updatedParty);
-
-    // Remove emoji after 3 seconds
-    setTimeout(() => {
-      setFloatingEmojis((prev) => prev.filter((e) => e.id !== newEmoji.id));
-    }, 3000);
   };
+
+  const partyShareUrl = getWatchPartyUrl(
+    party.id,
+    party.isPrivate ? (shareInviteToken ?? party.inviteToken) : undefined,
+  );
+
+  useEffect(() => {
+    if (!showShareModal || !party.isPrivate || shareInviteToken || party.inviteToken) return;
+    let cancelled = false;
+    (async () => {
+      try {
+        const preview = await apiGetRoomById(party.id);
+        if (!cancelled && preview.inviteToken) {
+          setShareInviteToken(preview.inviteToken);
+          onUpdateParty({ ...party, inviteToken: preview.inviteToken });
+        }
+      } catch {
+        // host token alına bilmədi
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [showShareModal, party.id, party.isPrivate, shareInviteToken, party.inviteToken]);
 
   return (
     <div className="space-y-6 max-w-7xl mx-auto p-1 animate-fade-in">
@@ -410,7 +837,7 @@ export default function WatchPartyRoom({
               <span className="px-2 py-0.5 bg-red-600/10 text-red-500 text-[8px] tracking-widest rounded-full font-mono font-bold uppercase animate-pulse">Canlı</span>
             </div>
             <p className="text-[10px] text-zinc-500 mt-0.5 font-sans">
-              Hazırda izlənilir: <strong className="text-red-500 font-bold">{movie.title}</strong> • Otaq Sahibi: <strong className={theme === 'dark' ? 'text-zinc-300 font-bold' : 'text-zinc-600 font-bold'}>@{party.creator === currentUser.username ? currentUser.username : party.creator}</strong>
+              Hazırda izlənilir: <strong className="text-red-500 font-bold">{movie.title}</strong> • Otaq Sahibi: <strong className={theme === 'dark' ? 'text-zinc-300 font-bold' : 'text-zinc-600 font-bold'}>@{isRoomHost(party, currentUser) ? currentUser.username : hostUsername}</strong>
             </p>
           </div>
         </div>
@@ -425,9 +852,24 @@ export default function WatchPartyRoom({
             className="flex items-center gap-1.5 py-1.5 px-4 text-[10px] uppercase tracking-wider font-mono font-bold rounded-full transition cursor-pointer bg-red-600 hover:bg-red-500 text-white shadow-lg shadow-red-600/10"
           >
             <Share2 className="w-3.5 h-3.5" />
-            Otağı Paylaş / Dəvət Et 📅
+            Paylaş
           </button>
-          {(party.creator === currentUser.username || currentUser.role === 'admin') && onCloseRoom && (
+          <button
+            onClick={() => {
+              navigator.clipboard.writeText(partyShareUrl);
+              toast.success('Link kopyalandı!');
+            }}
+            className={`flex items-center gap-1.5 py-1.5 px-3 text-[10px] uppercase tracking-wider font-mono font-bold rounded-full transition cursor-pointer border ${
+              theme === 'dark'
+                ? 'bg-zinc-900 border-zinc-700 text-zinc-300 hover:text-white'
+                : 'bg-white border-zinc-200 text-zinc-600 hover:text-zinc-900'
+            }`}
+            title="Otaq linkini kopyala"
+          >
+            <Copy className="w-3.5 h-3.5" />
+            Link
+          </button>
+          {(isRoomHost(party, currentUser) || currentUser.role === 'admin') && onCloseRoom && (
             <button
               onClick={() => onCloseRoom(party.id)}
               className="flex items-center gap-1.5 py-1.5 px-4 text-[10px] uppercase tracking-wider font-mono font-bold rounded-full transition cursor-pointer bg-amber-500/10 hover:bg-amber-500/20 text-amber-500 border border-amber-500/20"
@@ -437,7 +879,7 @@ export default function WatchPartyRoom({
               Otağı Bağla
             </button>
           )}
-          {(party.creator === currentUser.username || currentUser.role === 'admin') && onDeleteRoom && (
+          {(isRoomHost(party, currentUser) || currentUser.role === 'admin') && onDeleteRoom && (
             <button
               onClick={() => onDeleteRoom(party.id)}
               className="flex items-center gap-1.5 py-1.5 px-4 text-[10px] uppercase tracking-wider font-mono font-bold rounded-full transition cursor-pointer bg-red-500/10 hover:bg-red-500/20 text-red-500 border border-red-500/20"
@@ -486,47 +928,85 @@ export default function WatchPartyRoom({
                 );
               }
 
-              const rawUrl = movie.trailerUrl || '';
-              const { embedUrl, isEmbeddable, isDirectVideo, reason } = getEmbedUrl(rawUrl);
+              const playbackUrl = activeMediaUrl;
+              const usingYoutube = mediaSource.kind === 'youtube' && !forceDirectVideo;
 
               if (isDirectVideo) {
                 return (
                   <video
+                    key={embedUrl}
                     src={embedUrl}
                     autoPlay
                     controls
+                    playsInline
                     className="w-full h-full object-contain absolute inset-0 pointer-events-auto"
                   />
                 );
               }
 
-              if (isEmbeddable) {
+              if (isEmbeddable && embedUrl) {
                 return (
                   <div className="relative w-full h-full">
                     <iframe
+                      key={embedUrl}
                       src={embedUrl}
                       title="Cinematic stream player"
                       className="w-full h-full object-cover absolute inset-0 pointer-events-auto"
-                      allow="autoplay; encrypted-media; gyroscope; picture-in-picture"
+                      allow="autoplay; encrypted-media; gyroscope; picture-in-picture; fullscreen"
                       allowFullScreen
+                      referrerPolicy="strict-origin-when-cross-origin"
                     />
-                    {/* Floating Info Banner for Web Pages */}
-                    {!embedUrl.includes('youtube') && !embedUrl.includes('vimeo') && !isDirectVideo && (
-                      <div className="absolute top-3 left-3 right-3 z-30 pointer-events-auto flex items-center justify-between gap-2 p-2.5 px-3 rounded-xl bg-zinc-900/90 border border-zinc-700/80 text-white shadow-xl backdrop-blur-md">
+                    {!usingYoutube && !embedUrl.includes('vimeo') && !isDirectVideo && (
+                      <div className="absolute top-3 left-3 right-3 z-30 pointer-events-auto flex flex-wrap items-center justify-between gap-2 p-2.5 px-3 rounded-xl bg-zinc-900/90 border border-zinc-700/80 text-white shadow-xl backdrop-blur-md">
                         <div className="flex items-center gap-2 text-[11px] text-zinc-300 min-w-0">
-                          <span className="w-2 h-2 rounded-full bg-amber-400 animate-pulse flex-shrink-0" />
+                          <span className="w-2 h-2 rounded-full bg-amber-400 animate-pulse shrink-0" />
                           <span className="truncate">Sayt brauzer təhlükəsizliyinə görə qara görünərsə:</span>
                         </div>
                         <a
-                          href={rawUrl}
+                          href={playbackUrl}
                           target="_blank"
                           rel="noreferrer"
-                          className="px-3 py-1 bg-red-600 hover:bg-red-500 text-white text-[10px] font-bold rounded-lg transition-all flex-shrink-0 flex items-center gap-1"
+                          className="px-3 py-1 bg-red-600 hover:bg-red-500 text-white text-[10px] font-bold rounded-lg transition-all flex items-center gap-1"
                         >
                           Saytda Aç ↗
                         </a>
                       </div>
                     )}
+                  </div>
+                );
+              }
+
+              if (mediaSource.kind === 'none' && (mediaSource.youtubeWatchUrl || party.streamUrl)) {
+                return (
+                  <div className="absolute inset-0 flex flex-col items-center justify-center text-center p-6 z-10 bg-zinc-950/90">
+                    <img src={movie.banner || movie.poster} alt="" className="absolute inset-0 w-full h-full object-cover opacity-15 filter blur-md" />
+                    <div className="relative z-20 max-w-md bg-zinc-900/90 border border-red-500/30 p-5 rounded-2xl shadow-2xl space-y-3">
+                      <h3 className="text-sm font-bold text-white font-display">Video bu brauzerdə birbaşa açılmadı</h3>
+                      <p className="text-zinc-300 text-[11px] leading-relaxed">
+                        Başqa brauzer və ya aşağıdakı düymə ilə videonu açın. MP4 linki varsa avtomatik oynadılacaq.
+                      </p>
+                      <div className="flex flex-wrap gap-2 justify-center">
+                        {mediaSource.fallbackUrl && (
+                          <button
+                            type="button"
+                            onClick={() => setForceDirectVideo(true)}
+                            className="px-4 py-2 bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-bold rounded-xl"
+                          >
+                            Tam Filmi Oynat
+                          </button>
+                        )}
+                        {(mediaSource.youtubeWatchUrl || party.streamUrl) && (
+                          <a
+                            href={mediaSource.youtubeWatchUrl || party.streamUrl}
+                            target="_blank"
+                            rel="noreferrer"
+                            className="px-4 py-2 bg-red-600 hover:bg-red-500 text-white text-xs font-bold rounded-xl"
+                          >
+                            Videonu Aç ↗
+                          </a>
+                        )}
+                      </div>
+                    </div>
                   </div>
                 );
               }
@@ -646,7 +1126,7 @@ export default function WatchPartyRoom({
             <div className="flex items-center justify-between mb-3">
               <h3 className="font-bold text-sm flex items-center gap-2">
                 <UsersIcon className="w-4 h-4 text-zinc-400" />
-                Otaqdakı İzləyicilər ({party.participants.length})
+                Otaqdakı İzləyicilər ({liveViewerCount})
               </h3>
               <button
                 type="button"
@@ -661,8 +1141,8 @@ export default function WatchPartyRoom({
             <div className="flex flex-wrap gap-3">
               {party.participants.map((p) => {
                 const username = getParticipantUsername(p.id, p.name);
-                const isHost = username === party.creator || p.name === party.creator;
-                const canTransfer = (party.creator === currentUser.username || currentUser.role === 'admin') && !isHost;
+                const isHost = normalizeEntityId(p.id) === normalizeEntityId(party.creatorId ?? '') || username === hostUsername || p.name === hostUsername;
+                const canTransfer = (isRoomHost(party, currentUser) || currentUser.role === 'admin') && !isHost;
 
                 return (
                   <div key={p.id} className="flex items-center gap-2 px-3 py-1.5 bg-zinc-800/10 rounded-2xl border border-zinc-800/10">
@@ -709,7 +1189,7 @@ export default function WatchPartyRoom({
             </div>
           </div>
 
-          {movie.externalUrl && (
+          {movie.externalUrl && isNonEmbeddablePageUrl(movie.externalUrl) && mediaSource.kind === 'none' && (
             <div className={`p-4 border rounded-3xl flex flex-col sm:flex-row items-center justify-between gap-3 shadow-xl transition-all ${
               theme === 'dark' 
                 ? 'bg-gradient-to-r from-red-950/20 to-zinc-950/40 border-red-900/30' 
@@ -753,7 +1233,7 @@ export default function WatchPartyRoom({
             </div>
 
             {/* Chat messages area */}
-            <div className="flex-1 p-4 overflow-y-auto space-y-3.5">
+            <div className="flex-1 p-4 overflow-y-auto space-y-3.5" key={avatarCacheTick}>
               {party.chat.map((msg) => {
                 const isSystem = msg.sender === 'Sistem';
                 if (isSystem) {
@@ -766,7 +1246,7 @@ export default function WatchPartyRoom({
                   );
                 }
 
-                const isMe = msg.sender === currentUser.name;
+                const isMe = isOwnChatMessage(msg, currentUser);
                 const isGif = msg.message.startsWith('[GIF]:');
                 const isSticker = msg.message.startsWith('[STICKER]:');
                 let stickerObj = null;
@@ -777,7 +1257,19 @@ export default function WatchPartyRoom({
 
                 return (
                   <div key={msg.id} className={`flex items-start gap-2.5 max-w-[85%] ${isMe ? 'ml-auto flex-row-reverse' : ''}`}>
-                    <img src={msg.senderAvatar} alt={msg.sender} className="w-7 h-7 rounded-full object-cover" />
+                    <img
+                      src={resolveChatAvatar(msg, {
+                        users,
+                        currentUser,
+                        profileCache: participantProfileCacheRef.current,
+                      })}
+                      alt={msg.sender}
+                      onError={(e) => {
+                        e.currentTarget.onerror = null;
+                        e.currentTarget.src = DEFAULT_CHAT_AVATAR;
+                      }}
+                      className="w-7 h-7 rounded-full object-cover"
+                    />
                     <div>
                       <div className={`flex items-baseline gap-1.5 mb-1 ${isMe ? 'justify-end' : ''}`}>
                         <span className="text-[10px] font-bold text-zinc-400">@{getSenderUsername(msg.sender)}</span>
@@ -1033,12 +1525,12 @@ export default function WatchPartyRoom({
                 <input
                   type="text"
                   readOnly
-                  value={`https://cineverse.com/watch-party/${party.id}`}
+                  value={partyShareUrl}
                   className="bg-transparent border-none text-xs font-mono text-zinc-400 flex-1 focus:outline-none"
                 />
                 <button
                   onClick={() => {
-                    navigator.clipboard.writeText(`https://cineverse.com/watch-party/${party.id}`);
+                    navigator.clipboard.writeText(partyShareUrl);
                     setCopied(true);
                     setTimeout(() => setCopied(false), 2000);
                   }}
@@ -1059,7 +1551,7 @@ export default function WatchPartyRoom({
               <span className="block text-[9px] font-bold uppercase text-zinc-500 tracking-wider">Sosial Şəbəkələrdə Paylaş</span>
               <div className="grid grid-cols-3 gap-2">
                 <a 
-                  href={`https://api.whatsapp.com/send?text=Gəl%20birlikdə%20"${movie.title}"%20filmini%20izləyək!%20🍿🎥%20https://cineverse.com/watch-party/${party.id}`}
+                  href={`https://api.whatsapp.com/send?text=${encodeURIComponent(`Gəl birlikdə "${movie.title}" filmini izləyək! 🍿🎥 ${partyShareUrl}`)}`}
                   target="_blank"
                   rel="noreferrer"
                   className={`flex flex-col items-center justify-center p-3 rounded-2xl border text-center transition cursor-pointer ${
@@ -1071,7 +1563,7 @@ export default function WatchPartyRoom({
                 </a>
 
                 <a 
-                  href={`https://t.me/share/url?url=https://cineverse.com/watch-party/${party.id}&text=Gəl%20birlikdə%20"${movie.title}"%20filmini%20izləyək!%20🍿🎥`}
+                  href={`https://t.me/share/url?url=${encodeURIComponent(partyShareUrl)}&text=${encodeURIComponent(`Gəl birlikdə "${movie.title}" filmini izləyək! 🍿🎥`)}`}
                   target="_blank"
                   rel="noreferrer"
                   className={`flex flex-col items-center justify-center p-3 rounded-2xl border text-center transition cursor-pointer ${
@@ -1083,7 +1575,7 @@ export default function WatchPartyRoom({
                 </a>
 
                 <a 
-                  href={`https://twitter.com/intent/tweet?text=CineVerse-də%20"${movie.title}"%20filmini%20izləyirik,%20sən%20də%20qoşul!%20🍿🎥%20https://cineverse.com/watch-party/${party.id}`}
+                  href={`https://twitter.com/intent/tweet?text=${encodeURIComponent(`CineVerse-də "${movie.title}" filmini izləyirik, sən də qoşul! 🍿🎥 ${partyShareUrl}`)}`}
                   target="_blank"
                   rel="noreferrer"
                   className={`flex flex-col items-center justify-center p-3 rounded-2xl border text-center transition cursor-pointer ${

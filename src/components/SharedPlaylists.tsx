@@ -3,10 +3,10 @@ import { motion } from 'motion/react';
 import { 
   ListPlus, Users, Plus, Trash2, Share2, Film, Check, Play, Search,
   PlusCircle, UserPlus, Star, ChevronRight, MessageSquare, Flame, Sparkles,
-  Heart, Bookmark, Globe, Lock, Edit3, ShieldAlert
+  Heart, Bookmark, Globe, Lock, Edit3, ShieldAlert, ArrowLeft
 } from 'lucide-react';
 import { Movie, User } from '../types';
-import { MOCK_USERS } from '../data';
+import FullPageOverlay from './FullPageOverlay';
 import { 
   apiGetUserMovieCollections,
   apiGetSavedMovieCollections,
@@ -33,6 +33,7 @@ interface SharedPlaylistsProps {
   currentUser: User;
   theme: 'dark' | 'light';
   movies: Movie[];
+  inviteDirectory: User[];
   onSelectMovie: (movie: Movie) => void;
   setCurrentView: (view: string) => void;
 }
@@ -54,64 +55,16 @@ interface SharedPlaylist {
   coverImageUrl?: string;
 }
 
-const INITIAL_PLAYLISTS: SharedPlaylist[] = [
-  {
-    id: 'playlist_1',
-    name: 'Həftəsonu Qorxu və Triller Marafonu 🍿',
-    description: 'Dostlarla gecə izləmək üçün ən yaxşı ssenariyə malik trillerlər.',
-    creator: 'Ali_98',
-    creatorAvatar: 'https://images.unsplash.com/photo-1535713875002-d1d0cf377fde?w=100&auto=format&fit=crop&q=80',
-    contributors: [
-      { username: 'Ali_98', avatar: 'https://images.unsplash.com/photo-1535713875002-d1d0cf377fde?w=100&auto=format&fit=crop&q=80' },
-      { username: 'Leyla_K', avatar: 'https://images.unsplash.com/photo-1494790108377-be9c29b29330?w=100&auto=format&fit=crop&q=80' },
-      { username: 'Samir_H', avatar: 'https://images.unsplash.com/photo-1570295999919-56ceb5ecca61?w=100&auto=format&fit=crop&q=80' }
-    ],
-    movies: [], // will populate with a couple of movies
-    createdAt: '2026-07-01',
-    likesCount: 14,
-    isLikedByCurrentUser: false,
-    isSaved: false,
-    isPublic: true
-  },
-  {
-    id: 'playlist_2',
-    name: 'Nolan Şah Əsərləri və Elm Kurgu 🚀',
-    description: 'Ağlasığmaz süjet xətti, fizika nəzəriyyələri və kosmos mövzulu əfsanələr.',
-    creator: 'Emin_Fan',
-    creatorAvatar: 'https://images.unsplash.com/photo-1472099645785-5658abf4ff4e?w=100&auto=format&fit=crop&q=80',
-    contributors: [
-      { username: 'Emin_Fan', avatar: 'https://images.unsplash.com/photo-1472099645785-5658abf4ff4e?w=100&auto=format&fit=crop&q=80' },
-      { username: 'Gunay_L', avatar: 'https://images.unsplash.com/photo-1534528741775-53994a69daeb?w=100&auto=format&fit=crop&q=80' }
-    ],
-    movies: [], // will populate with a couple of movies
-    createdAt: '2026-07-04',
-    likesCount: 28,
-    isLikedByCurrentUser: false,
-    isSaved: true,
-    isPublic: true
-  }
-];
 
 export default function SharedPlaylists({
   currentUser,
   theme,
   movies,
+  inviteDirectory,
   onSelectMovie,
   setCurrentView
 }: SharedPlaylistsProps) {
-  // Populate initial playlists with real movies
-  const getInitialPlaylists = (): SharedPlaylist[] => {
-    const list = [...INITIAL_PLAYLISTS];
-    if (movies.length > 0) {
-      // First playlist gets 1st and 2nd movies
-      list[0].movies = [movies[0], movies[Math.min(movies.length - 1, 2)]].filter(Boolean);
-      // Second playlist gets 3rd and 4th movies
-      list[1].movies = [movies[Math.min(movies.length - 1, 1)], movies[Math.min(movies.length - 1, 3)]].filter(Boolean);
-    }
-    return list;
-  };
-
-  const [playlists, setPlaylists] = useState<SharedPlaylist[]>(getInitialPlaylists());
+  const [playlists, setPlaylists] = useState<SharedPlaylist[]>([]);
   const [selectedPlaylist, setSelectedPlaylist] = useState<SharedPlaylist | null>(null);
   
   // Create / Edit Modal state
@@ -165,11 +118,9 @@ export default function SharedPlaylists({
             isPublic: c.isPublic !== false,
             coverImageUrl: c.coverImageUrl
           }));
-          setPlaylists(prev => {
-            const existingIds = new Set(prev.map(p => p.id));
-            const newOnes = mapped.filter(m => !existingIds.has(m.id));
-            return [...newOnes, ...prev];
-          });
+          setPlaylists(mapped);
+        } else {
+          setPlaylists([]);
         }
       } catch (e) {
         // Fallback gracefully
@@ -547,7 +498,7 @@ export default function SharedPlaylists({
     }
   };
 
-  const handleInviteContributor = (contributor: typeof MOCK_USERS[0]) => {
+  const handleInviteContributor = (contributor: User) => {
     if (!selectedPlaylist) return;
     if (!isPlaylistOwnerOrContributor(selectedPlaylist)) {
       triggerToast('Yalnız müəllif və ya həmmüəlliflər başqalarını dəvət edə bilər!');
@@ -569,23 +520,6 @@ export default function SharedPlaylists({
     setSelectedPlaylist(updatedPlaylist);
     setShowInviteDropdown(false);
     triggerToast(`@${contributor.username} pleylistə dəvət edildi! 🤝`);
-
-    // Simulate collaborative action: Friend adding a movie after 4 seconds
-    setTimeout(() => {
-      // Find a movie not in the playlist
-      const movieToAdd = movies.find(m => !updatedPlaylist.movies.some(pm => pm.id === m.id));
-      if (movieToAdd) {
-        const finalPlaylist = {
-          ...updatedPlaylist,
-          movies: [...updatedPlaylist.movies, movieToAdd]
-        };
-        setPlaylists(prev => prev.map(p => p.id === updatedPlaylist.id ? finalPlaylist : p));
-        if (selectedPlaylist && selectedPlaylist.id === updatedPlaylist.id) {
-          setSelectedPlaylist(finalPlaylist);
-        }
-        triggerToast(`@${contributor.username} yeni bir film əlavə etdi: "${movieToAdd.title}" 🍿`);
-      }
-    }, 4500);
   };
 
   const openEditModal = (p: SharedPlaylist, e?: React.MouseEvent) => {
@@ -778,7 +712,10 @@ export default function SharedPlaylists({
                                 : 'bg-white border-zinc-200 text-zinc-900 shadow-xl'
                             }`}>
                               <p className="text-[10px] font-mono uppercase text-zinc-400 p-1 tracking-wider">Kinoçuları Dəvət et</p>
-                              {MOCK_USERS.filter(u => u.username !== currentUser.username).slice(0, 5).map((u) => (
+                              {inviteDirectory.filter(u => u.username !== currentUser.username).length === 0 ? (
+                                <p className="text-[10px] text-zinc-500 p-2">Dəvət üçün dost və ya izlənilən tapılmadı.</p>
+                              ) : (
+                                inviteDirectory.filter(u => u.username !== currentUser.username).slice(0, 8).map((u) => (
                                 <button
                                   key={u.id}
                                   onClick={() => handleInviteContributor(u)}
@@ -794,7 +731,8 @@ export default function SharedPlaylists({
                                   </div>
                                   <span className="text-[10px] text-red-500 font-bold">+ Dəvət</span>
                                 </button>
-                              ))}
+                              ))
+                              )}
                             </div>
                           </>
                         )}
@@ -1098,53 +1036,91 @@ export default function SharedPlaylists({
     </div>
   )}
 
-      {/* New / Edit Shared Playlist modal */}
+      {/* New / Edit Shared Playlist — full page */}
       {showCreateModal && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/60 backdrop-blur-xs">
-          <div className={`w-full max-w-md p-6 rounded-3xl border shadow-2xl relative ${
-            theme === 'dark' ? 'bg-zinc-950 border-zinc-800 text-white' : 'bg-white border-zinc-200 text-zinc-900'
+        <FullPageOverlay className={`animate-fade-in ${theme === 'dark' ? 'bg-zinc-950 text-white' : 'bg-zinc-100 text-zinc-900'}`}>
+          <header className={`sticky top-0 z-20 px-6 py-4 backdrop-blur-md border-b flex items-center justify-between shrink-0 ${
+            theme === 'dark' ? 'bg-zinc-900/90 border-zinc-800' : 'bg-white/90 border-zinc-200'
           }`}>
-            <h3 className="text-sm font-bold font-display tracking-tight mb-4 flex items-center gap-2">
+            <button
+              type="button"
+              onClick={() => setShowCreateModal(false)}
+              className={`px-4 py-2 rounded-xl text-xs font-bold transition cursor-pointer flex items-center gap-2 ${
+                theme === 'dark' ? 'bg-zinc-800 hover:bg-zinc-700 text-white' : 'bg-zinc-200 hover:bg-zinc-300 text-zinc-900'
+              }`}
+            >
+              <ArrowLeft className="w-4 h-4" /> Pleylistlərə Qayıt
+            </button>
+            <h2 className="text-sm font-black tracking-tight uppercase flex items-center gap-2">
               <ListPlus className="w-4 h-4 text-red-500" />
               {editingPlaylistId ? 'Kolleksiyanı Redaktə Et' : 'Yeni Ortaq Pleylist Yarat'}
-            </h3>
+            </h2>
+            <div className="w-28" />
+          </header>
 
-            <form onSubmit={handleSavePlaylist} className="space-y-4">
-              <div className="space-y-1">
-                <label className="text-[10px] font-mono uppercase tracking-wider text-zinc-500">Siyahı Adı *</label>
+          <main className="flex-1 max-w-3xl w-full mx-auto p-6 sm:p-10 space-y-8">
+            <div className="space-y-1">
+              <span className="px-3 py-1 bg-red-600/10 border border-red-500/20 text-red-500 text-[10px] font-black uppercase tracking-widest rounded-full">
+                Birgə İzləmə Siyahısı
+              </span>
+              <h1 className="text-2xl sm:text-3xl font-black tracking-tight font-display">
+                {editingPlaylistId ? 'Pleylisti Yeniləyin' : 'Yeni Pleylist Yaradın'}
+              </h1>
+              <p className="text-xs text-zinc-500">
+                Dostlarınızla birgə idarə edə biləcəyiniz film siyahısı yaradın və ya mövcud siyahını redaktə edin.
+              </p>
+            </div>
+
+            <form onSubmit={handleSavePlaylist} className={`space-y-6 p-6 sm:p-8 rounded-3xl border ${
+              theme === 'dark' ? 'bg-zinc-900/50 border-zinc-800' : 'bg-white border-zinc-200 shadow-sm'
+            }`}>
+              <div className="space-y-1.5">
+                <label className="text-xs font-bold uppercase tracking-wider text-zinc-400">Siyahı Adı *</label>
                 <input
                   type="text"
                   required
                   placeholder="Məsələn: Dostlarla qorxu gecəsi... 👻"
                   value={newPlaylistName}
                   onChange={(e) => setNewPlaylistName(e.target.value)}
-                  className="w-full bg-zinc-900 border border-zinc-800 rounded-xl px-3 py-2.5 text-xs text-white placeholder-zinc-500 focus:outline-none focus:ring-1 focus:ring-red-500"
+                  className={`w-full rounded-xl px-4 py-3 text-sm focus:outline-none focus:ring-1 focus:ring-red-500 border ${
+                    theme === 'dark'
+                      ? 'bg-zinc-950 border-zinc-800 text-white placeholder-zinc-500'
+                      : 'bg-zinc-50 border-zinc-200 text-zinc-900 placeholder-zinc-400'
+                  }`}
                 />
               </div>
 
-              <div className="space-y-1">
-                <label className="text-[10px] font-mono uppercase tracking-wider text-zinc-500">Təsviri (İstəyə görə)</label>
+              <div className="space-y-1.5">
+                <label className="text-xs font-bold uppercase tracking-wider text-zinc-400">Təsviri (İstəyə görə)</label>
                 <textarea
                   placeholder="Bu pleylist haqqında qısa məlumat..."
                   value={newPlaylistDesc}
                   onChange={(e) => setNewPlaylistDesc(e.target.value)}
-                  rows={2}
-                  className="w-full bg-zinc-900 border border-zinc-800 rounded-xl px-3 py-2 text-xs text-white placeholder-zinc-500 focus:outline-none focus:ring-1 focus:ring-red-500 resize-none"
+                  rows={4}
+                  className={`w-full rounded-xl px-4 py-3 text-sm focus:outline-none focus:ring-1 focus:ring-red-500 resize-none border ${
+                    theme === 'dark'
+                      ? 'bg-zinc-950 border-zinc-800 text-white placeholder-zinc-500'
+                      : 'bg-zinc-50 border-zinc-200 text-zinc-900 placeholder-zinc-400'
+                  }`}
                 />
               </div>
 
-              <div className="space-y-1">
-                <label className="text-[10px] font-mono uppercase tracking-wider text-zinc-500">Örtük Şəkli URL-i (İstəyə görə)</label>
+              <div className="space-y-1.5">
+                <label className="text-xs font-bold uppercase tracking-wider text-zinc-400">Örtük Şəkli URL-i (İstəyə görə)</label>
                 <input
                   type="url"
                   placeholder="https://images.unsplash.com/photo-..."
                   value={coverImageUrl}
                   onChange={(e) => setCoverImageUrl(e.target.value)}
-                  className="w-full bg-zinc-900 border border-zinc-800 rounded-xl px-3 py-2 text-xs text-white placeholder-zinc-500 focus:outline-none focus:ring-1 focus:ring-red-500"
+                  className={`w-full rounded-xl px-4 py-3 text-sm focus:outline-none focus:ring-1 focus:ring-red-500 border ${
+                    theme === 'dark'
+                      ? 'bg-zinc-950 border-zinc-800 text-white placeholder-zinc-500'
+                      : 'bg-zinc-50 border-zinc-200 text-zinc-900 placeholder-zinc-400'
+                  }`}
                 />
               </div>
 
-              <div className="flex items-center gap-2 pt-1">
+              <div className="flex items-center gap-3 pt-1">
                 <input
                   type="checkbox"
                   id="isPublicCheckbox"
@@ -1152,29 +1128,31 @@ export default function SharedPlaylists({
                   onChange={(e) => setIsPublicCollection(e.target.checked)}
                   className="rounded bg-zinc-900 border-zinc-800 text-red-600 focus:ring-red-500 w-4 h-4"
                 />
-                <label htmlFor="isPublicCheckbox" className="text-xs text-zinc-300 cursor-pointer select-none">
+                <label htmlFor="isPublicCheckbox" className="text-sm text-zinc-300 cursor-pointer select-none">
                   Hər kəsə açıq (İctimai) kolleksiya kimi yayımla
                 </label>
               </div>
 
-              <div className="flex items-center justify-end gap-2 pt-2">
+              <div className="flex items-center justify-end gap-3 pt-4 border-t border-zinc-800/40">
                 <button
                   type="button"
                   onClick={() => setShowCreateModal(false)}
-                  className="py-2 px-4 rounded-xl text-xs font-semibold hover:bg-white/5 text-zinc-400 transition cursor-pointer"
+                  className={`py-2.5 px-5 rounded-xl text-xs font-semibold transition cursor-pointer ${
+                    theme === 'dark' ? 'text-zinc-400 hover:text-white' : 'text-zinc-600 hover:text-zinc-900'
+                  }`}
                 >
-                  Geri
+                  Ləğv Et
                 </button>
                 <button
                   type="submit"
-                  className="py-2 px-5 bg-red-600 hover:bg-red-500 text-white text-xs font-semibold rounded-xl shadow-lg transition cursor-pointer"
+                  className="py-2.5 px-6 bg-red-600 hover:bg-red-500 text-white text-xs font-black uppercase tracking-wider rounded-xl shadow-lg transition cursor-pointer"
                 >
                   {editingPlaylistId ? 'Yenilə ✨' : 'Pleylisti Yarat 🚀'}
                 </button>
               </div>
             </form>
-          </div>
-        </div>
+          </main>
+        </FullPageOverlay>
       )}
     </div>
   );

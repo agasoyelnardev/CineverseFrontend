@@ -1,16 +1,30 @@
-import React, { useState, useEffect, useRef } from 'react';
+import { apiGetMovies, apiGetBooks } from './api';
+import React, { useState, useEffect, useRef, useCallback } from 'react';
+import toast from 'react-hot-toast';
 import { motion, AnimatePresence } from 'motion/react';
 import { 
   Film, Search, Bell, Heart, Bookmark, Users, MessageSquare, Shield, 
   Trash2, Plus, Star, Award, ChevronLeft, ChevronRight, User as UserIcon, Play, Pause,
   Sparkles, Check, X, LogOut, Clock, Grid, Compass, ExternalLink, Moon, Sun, Filter, Share2, MessageCircle,
   Volume2, VolumeX, Maximize2, Minimize2, Settings, Subtitles, ThumbsUp, ThumbsDown, Edit2, Loader2, RotateCcw, SearchX,
-  BookOpen
+  BookOpen, Lock, Globe
 } from 'lucide-react';
 import { Movie, User, Collection, Discussion, Notification, Activity, Review, WatchParty, Book, BookCollection, BookVsMovie } from './types';
-import { MOCK_MOVIES, MOCK_USERS, MOCK_COLLECTIONS, MOCK_DISCUSSIONS, MOCK_NOTIFICATIONS, MOCK_ACTIVITIES, MOCK_WATCH_PARTIES, MOCK_BOOKS, MOCK_BOOK_COLLECTIONS, MOCK_BOOK_VS_MOVIES } from './data';
+import { useNotificationHub } from './hooks/useNotificationHub';
+import { normalizeEntityId, extractIdList, idsInclude, mergeMoviesById, mergeBooksById } from './utils/entityIds';
+import { resolvePartyMovie } from './utils/watchPartyMovie';
+import { isBackendRoomId } from './utils/watchPartyRoom';
+import {
+  parseWatchPartyRoute,
+  syncWatchPartyUrl,
+  clearWatchPartyUrl,
+  mapPreviewToWatchParty,
+  getWatchPartyUrl,
+} from './utils/watchPartyUrl';
+import { isRoomHost, resolveLocalUsername } from './utils/watchPartyUtils';
 
 import LoginRegister from './components/LoginRegister';
+import WatchPartyGuestPreview from './components/WatchPartyGuestPreview';
 import Navbar from './components/Navbar';
 import Sidebar from './components/Sidebar';
 import AdminPanel from './components/AdminPanel';
@@ -21,7 +35,7 @@ import LiveStream from './components/LiveStream';
 import SharedPlaylists from './components/SharedPlaylists';
 import PremiumModal from './components/PremiumModal';
 import BooksSection from './components/BooksSection';
-import GamificationBadges from './components/GamificationBadges';
+import GamificationBadges, { getHighestBadgeForPoints } from './components/GamificationBadges';
 import EmptyState from './components/EmptyState';
 import LazyImage from './components/LazyImage';
 import { 
@@ -40,6 +54,8 @@ import {
   apiLikeMovieReview,
   apiDislikeMovieReview,
   apiGetActiveRooms,
+  apiGetRoomById,
+  apiJoinRoomWithInviteToken,
   apiCreateRoom,
   apiDeleteRoom,
   apiCloseRoom,
@@ -49,9 +65,43 @@ import {
   apiGetActivityStream,
   apiToggleBookFavorite,
   apiToggleBookWatchlist,
+  apiGetUserBookFavorites,
+  apiGetUserBookWatchlist,
   PublicStatsDto,
-  GlobalSearchResultDto
+  GlobalSearchResultDto,
+  RoomPreviewDto,
+  apiGetMe,
+  apiGetUserProfile,
+  apiAddMyPoints,
+  apiLogout,
+  apiUpdateProfile,
+  apiChangePassword,
+  apiGetFollowers,
+  apiGetFollowing,
+  apiFollowUser,
+  apiUnfollowUser,
+  apiGetFriends,
+  apiGetPendingFriendRequests,
+  apiSendFriendRequest,
+  apiAcceptFriendRequest,
+  apiDeclineFriendRequest,
+  apiRemoveFriend,
+  apiGetAllMovieCollections,
+  apiCreateMovieCollection,
+  apiAddMovieToCollection,
+  apiToggleMovieCollectionLike,
+  apiGetAllReadingProgress,
+  FriendDto,
+  FriendRequestDto,
+  apiAskAiChat,
+  getAuthToken,
+  removeAuthToken,
 } from './api';
+import {
+  stopChatConnection,
+  stopLiveStreamConnection,
+  stopNotificationConnection,
+} from './signalr';
 import { 
   MovieGridSkeleton, 
   BookGridSkeleton, 
@@ -61,14 +111,343 @@ import {
   MovieDetailsSkeleton 
 } from './components/SkeletonLoader';
 
+const DEFAULT_USER_AVATAR = 'https://images.unsplash.com/photo-1535713875002-d1d0cf377fde?w=150&auto=format&fit=crop&q=80';
+
+function toInviteUser(id: string, username: string, avatar?: string): User {
+  return {
+    id,
+    username,
+    name: username,
+    email: '',
+    avatar: avatar || DEFAULT_USER_AVATAR,
+    bio: '',
+    followersCount: 0,
+    followingCount: 0,
+    role: 'user',
+    favorites: [],
+    watchlist: [],
+    savedCollections: [],
+    followers: [],
+    following: [],
+  };
+}
+
+function buildInviteDirectory(
+  friendsList: FriendDto[],
+  followingList: any[],
+  currentUserId: string,
+): User[] {
+  const directoryMap = new Map<string, User>();
+  friendsList.forEach((friend) => {
+    directoryMap.set(friend.id, toInviteUser(friend.id, friend.userName, friend.avatar));
+  });
+  followingList.forEach((item) => {
+    const id = String(item.id ?? item.Id ?? '');
+    if (!id || id === currentUserId || directoryMap.has(id)) return;
+    directoryMap.set(id, toInviteUser(id, item.userName ?? item.username ?? '', item.avatar));
+  });
+  return Array.from(directoryMap.values());
+}
+
+function mapBackendMovie(m: any): Movie {
+  return {
+    id: normalizeEntityId(m.id ?? m.Id),
+    title: m.title,
+    originalTitle: m.originalTitle || m.title,
+    description: m.description,
+    poster: m.poster,
+    banner: m.banner,
+    rating: m.rating,
+    year: m.year,
+    duration: m.duration,
+    director: m.director,
+    genres: m.genres || [],
+    cast: m.cast || [],
+    trailerUrl: m.trailerUrl,
+    videoUrl: m.videoUrl,
+    externalUrl: m.externalUrl,
+    likes: m.likes || 0,
+    reviews: [],
+    isTrending: m.isTrending,
+    isTopRated: m.isTopRated,
+    isNewRelease: m.isNewRelease,
+  };
+}
+
+function mapBackendBook(b: any): Book {
+  return {
+    id: normalizeEntityId(b.id ?? b.Id),
+    title: b.title,
+    author: b.author || 'Naməlum Müəllif',
+    description: b.description || '',
+    cover: b.cover || '',
+    rating: b.rating || 0,
+    language: b.language === 'en' ? 'en' : 'az',
+    genres: b.genres || [],
+    year: b.year || new Date().getFullYear(),
+    pages: b.pages || 0,
+    reviews: [],
+    likes: b.likes || 0,
+    isLikedByCurrentUser: !!(b.isLikedByCurrentUser ?? b.IsLikedByCurrentUser),
+    movieAdaptationId: b.movieAdaptationId,
+    downloadUrl: b.downloadUrl,
+    pdfUrl: b.pdfUrl ?? b.PdfUrl,
+    customContent: b.customContent,
+    isTrending: b.isTrending,
+    isTopRated: b.isTopRated,
+    isNewRelease: b.isNewRelease,
+  };
+}
+
+const MOVIES_PAGE_SIZE = 20;
+
 export default function App() {
   // Session / Authentication state (Starts as null so Giriş section opens on fresh page load)
-  const [currentUser, setCurrentUser] = useState<User | null>(null);
+const [currentUser, setCurrentUser] = useState<User | null>(null);
+const [isCheckingSession, setIsCheckingSession] = useState<boolean>(true);
 
-  // Clean up any legacy saved session so user is presented with Giriş screen on reload
-  useEffect(() => {
-    localStorage.removeItem('cineverse_current_user');
-  }, []);
+useEffect(() => {
+  const restoreSession = async () => {
+    const token = getAuthToken(); // api.ts-dən import edilməlidir
+
+    if (!token) {
+      setIsCheckingSession(false);
+      return;
+    }
+
+    try {
+      const profile = await apiGetMe();
+      const rawRole = profile.Role || profile.role || (Array.isArray(profile.roles) ? profile.roles[0] : '');
+      const isAdmin = 
+        (typeof rawRole === 'string' && rawRole.toLowerCase() === 'admin') ||
+        (Array.isArray(profile.roles) && profile.roles.some((r: any) => typeof r === 'string' && r.toLowerCase() === 'admin')) ||
+        profile.email?.toLowerCase() === 'admin@gmail.com';
+
+      // /auth/me minimal məlumat qaytara bilər (points/badge/isPremium olmaya bilər),
+      // ona görə /users/{id} endpoint-indən tam profil DTO-sunu əlavə çəkirik.
+      let fullProfile: any = null;
+      try {
+        fullProfile = await apiGetUserProfile(profile.id);
+      } catch (err) {
+        console.warn('Tam profil (xal/nişan) çəkilə bilmədi, defolt dəyərlərlə davam edilir:', err);
+      }
+
+      const mappedUser: User = {
+        id: profile.id,
+        username: profile.userName ?? profile.username ?? '',
+        name: profile.fullName ?? profile.name ?? profile.userName ?? '',
+        email: profile.email ?? '',
+        avatar: fullProfile?.avatar || profile.avatar || 'https://images.unsplash.com/photo-1535713875002-d1d0cf377fde?w=150&auto=format&fit=crop&q=80',
+        bio: fullProfile?.bio ?? profile.bio ?? '',
+        followersCount: fullProfile?.followersCount ?? profile.followersCount ?? 0,
+        followingCount: fullProfile?.followingCount ?? profile.followingCount ?? 0,
+        points: fullProfile?.points ?? 0,
+        badge: getHighestBadgeForPoints(fullProfile?.points ?? 0).name,
+        isPremium: fullProfile?.isPremium ?? false,
+        role: isAdmin ? 'admin' : 'user',
+        favorites: extractIdList(profile, 'favoriteMovieIds', 'FavoriteMovieIds'),
+        watchlist: extractIdList(profile, 'watchlistMovieIds', 'WatchlistMovieIds'),
+        favoriteBooks: extractIdList(profile, 'favoriteBookIds', 'FavoriteBookIds'),
+        savedCollections: [],
+        followers: [],
+        following: Array.isArray(profile.followingUserIds)
+          ? profile.followingUserIds
+          : Array.isArray(profile.following)
+            ? profile.following
+            : [],
+      };
+      setCurrentUser(mappedUser);
+
+      if (mappedUser.role === 'admin') {
+        setIsAdminMode(true);
+      }
+    } catch (err) {
+      console.warn('Sessiya bərpa oluna bilmədi, yenidən login lazımdır:', err);
+      removeAuthToken(); 
+    } finally {
+      setIsCheckingSession(false);
+    }
+  };
+
+  restoreSession();
+}, []);
+
+useEffect(() => {
+  if (!currentUser?.id) return;
+  let isCancelled = false;
+
+  const loadUserLists = async () => {
+    const [movieFavsRes, movieWatchlistRes, bookFavsRes, bookWatchlistRes, readingProgressRes] = await Promise.allSettled([
+      apiGetMovieFavorites(),
+      apiGetMovieWatchlist(),
+      apiGetUserBookFavorites(),
+      apiGetUserBookWatchlist(),
+      apiGetAllReadingProgress(),
+    ]);
+
+    if (isCancelled) return;
+
+    const getValue = (res: PromiseSettledResult<any>) =>
+      res.status === 'fulfilled' && Array.isArray(res.value) ? res.value : [];
+
+    if (movieFavsRes.status === 'rejected') console.warn('Film sevimliləri yüklənmədi:', movieFavsRes.reason);
+    if (movieWatchlistRes.status === 'rejected') console.warn('Film izləmə siyahısı yüklənmədi:', movieWatchlistRes.reason);
+    if (bookFavsRes.status === 'rejected') console.warn('Kitab sevimliləri yüklənmədi:', bookFavsRes.reason);
+    if (bookWatchlistRes.status === 'rejected') console.warn('Kitab izləmə siyahısı yüklənmədi:', bookWatchlistRes.reason);
+    if (readingProgressRes.status === 'rejected') console.warn('Oxuma progressi yüklənmədi:', readingProgressRes.reason);
+
+    const favoriteIds = getValue(movieFavsRes).map((m: any) => normalizeEntityId(m.id ?? m.Id)).filter(Boolean);
+    const watchlistIds = getValue(movieWatchlistRes).map((m: any) => normalizeEntityId(m.id ?? m.Id)).filter(Boolean);
+    const favoriteBookIds = getValue(bookFavsRes).map((b: any) => normalizeEntityId(b.id ?? b.Id)).filter(Boolean);
+    const watchlistBookIds = getValue(bookWatchlistRes).map((b: any) => normalizeEntityId(b.id ?? b.Id)).filter(Boolean);
+
+    const favoriteMoviesFromApi = getValue(movieFavsRes).map(mapBackendMovie);
+    const watchlistMoviesFromApi = getValue(movieWatchlistRes).map(mapBackendMovie);
+    const favoriteBooksFromApi = getValue(bookFavsRes).map(mapBackendBook);
+    const watchlistBooksFromApi = getValue(bookWatchlistRes).map(mapBackendBook);
+
+    setMovies((prev) => mergeMoviesById(prev, [...favoriteMoviesFromApi, ...watchlistMoviesFromApi]));
+    setBooks((prev) => mergeBooksById(prev, [...favoriteBooksFromApi, ...watchlistBooksFromApi]));
+
+    const readingProgressRaw =
+      readingProgressRes.status === 'fulfilled' && readingProgressRes.value && typeof readingProgressRes.value === 'object'
+        ? readingProgressRes.value as Record<string, number>
+        : {};
+    const readingProgressMap: Record<string, number> = {};
+    Object.entries(readingProgressRaw).forEach(([bookId, pct]) => {
+      readingProgressMap[String(bookId)] = Number(pct) || 0;
+    });
+
+    setCurrentUser((prev) => {
+      if (!prev) return prev;
+      return {
+        ...prev,
+        favorites: favoriteIds,
+        watchlist: watchlistIds,
+        favoriteBooks: favoriteBookIds,
+        watchlistBooks: watchlistBookIds,
+        readingProgress: readingProgressMap,
+      };
+    });
+  };
+
+  loadUserLists();
+  return () => { isCancelled = true; };
+}, [currentUser?.id]);
+
+useEffect(() => {
+  if (!currentUser?.id) {
+    setFriends([]);
+    setPendingFriendRequests([]);
+    setInviteDirectory([]);
+    return;
+  }
+
+  let isCancelled = false;
+
+  const loadFriendsAndInviteDirectory = async () => {
+    try {
+      const [friendsRes, pendingRes, followingRes] = await Promise.all([
+        apiGetFriends(currentUser.id),
+        apiGetPendingFriendRequests(),
+        apiGetFollowing(currentUser.id),
+      ]);
+      if (isCancelled) return;
+
+      const friendsList = Array.isArray(friendsRes) ? friendsRes : [];
+      const pendingList = Array.isArray(pendingRes) ? pendingRes : [];
+      const followingList = Array.isArray(followingRes) ? followingRes : [];
+
+      setFriends(friendsList);
+      setPendingFriendRequests(pendingList);
+      setInviteDirectory(buildInviteDirectory(friendsList, followingList, currentUser.id));
+    } catch (err) {
+      console.warn('Dostluq məlumatları yüklənmədi:', err);
+    }
+  };
+
+  loadFriendsAndInviteDirectory();
+  return () => { isCancelled = true; };
+}, [currentUser?.id]);
+
+useEffect(() => {
+  if (!currentUser?.id) {
+    setCollections([]);
+    return;
+  }
+
+  let isCancelled = false;
+
+  const loadHomeCollections = async () => {
+    try {
+      const res = await apiGetAllMovieCollections(1, 20);
+      if (isCancelled) return;
+
+      const items = Array.isArray(res) ? res : (res?.items ?? []);
+      const mapped: Collection[] = items.map((c: any) => {
+        const movieCount = c.movieCount ?? c.MovieCount ?? 0;
+        return {
+          id: String(c.id ?? c.Id),
+          title: c.name ?? c.Name ?? 'Kolleksiya',
+          description: c.description ?? c.Description ?? '',
+          cover: c.coverImageUrl ?? c.CoverImageUrl ?? 'https://images.unsplash.com/photo-1451187580459-43490279c0fa?w=600&auto=format&fit=crop&q=80',
+          userId: String(c.appUserId ?? c.AppUserId ?? ''),
+          username: c.username ?? c.Username ?? 'unknown',
+          likesCount: c.likesCount ?? c.LikesCount ?? 0,
+          movies: Array.from({ length: movieCount }, (_, index) => `movie_slot_${index}`),
+          movieCount,
+          isLikedByCurrentUser: !!(c.isLikedByCurrentUser ?? c.IsLikedByCurrentUser),
+        };
+      });
+
+      setCollections(mapped);
+    } catch (err) {
+      console.warn('Home kolleksiyaları yüklənmədi:', err);
+      if (!isCancelled) setCollections([]);
+    }
+  };
+
+  loadHomeCollections();
+  return () => { isCancelled = true; };
+}, [currentUser?.id]);
+
+// Sosial statistika: followers/following siyahıları və count-lar backend-dən
+useEffect(() => {
+  if (!currentUser?.id) return;
+  let isCancelled = false;
+
+  const loadSocialGraph = async () => {
+    try {
+      const [followersRes, followingRes] = await Promise.all([
+        apiGetFollowers(currentUser.id),
+        apiGetFollowing(currentUser.id),
+      ]);
+      if (isCancelled) return;
+
+      const followersList = Array.isArray(followersRes) ? followersRes : [];
+      const followingList = Array.isArray(followingRes) ? followingRes : [];
+      const followersIds = followersList.map((u) => u.id).filter(Boolean);
+      const followingIds = followingList.map((u) => u.id).filter(Boolean);
+
+      setCurrentUser((prev) => {
+        if (!prev) return prev;
+        return {
+          ...prev,
+          followers: followersIds,
+          following: followingIds,
+          followersCount: followersIds.length,
+          followingCount: followingIds.length,
+        };
+      });
+    } catch (err) {
+      console.warn('Sosial statistika yüklənmədi:', err);
+    }
+  };
+
+  loadSocialGraph();
+  return () => { isCancelled = true; };
+}, [currentUser?.id]);
+
 
   // Invite Modal State
   const [showInviteModal, setShowInviteModal] = useState<boolean>(false);
@@ -77,18 +456,31 @@ export default function App() {
   const [inviteModalParty, setInviteModalParty] = useState<WatchParty | null>(null);
 
   // Core lists
-  const [movies, setMovies] = useState<Movie[]>(MOCK_MOVIES);
-  const [users, setUsers] = useState<User[]>(MOCK_USERS);
-  const [collections, setCollections] = useState<Collection[]>(MOCK_COLLECTIONS);
-  const [discussions, setDiscussions] = useState<Discussion[]>(MOCK_DISCUSSIONS);
-  const [notifications, setNotifications] = useState<Notification[]>(MOCK_NOTIFICATIONS);
-  const [activities, setActivities] = useState<Activity[]>(MOCK_ACTIVITIES);
-  const [watchParties, setWatchParties] = useState<WatchParty[]>(MOCK_WATCH_PARTIES);
+  const [movies, setMovies] = useState<Movie[]>([]);
+  const [users, setUsers] = useState<User[]>([]);
+  const [collections, setCollections] = useState<Collection[]>([]);
+  const [friends, setFriends] = useState<FriendDto[]>([]);
+  const [pendingFriendRequests, setPendingFriendRequests] = useState<FriendRequestDto[]>([]);
+  const [inviteDirectory, setInviteDirectory] = useState<User[]>([]);
+  const [friendActionPending, setFriendActionPending] = useState<Set<string>>(new Set());
+  const [socialUserSearch, setSocialUserSearch] = useState('');
+  const [socialUserResults, setSocialUserResults] = useState<any[]>([]);
+  const [socialUserSearchLoading, setSocialUserSearchLoading] = useState(false);
+  const [discussions, setDiscussions] = useState<Discussion[]>([]);
+  const [notifications, setNotifications] = useState<Notification[]>([]);
+  const [realtimeUnreadCount, setRealtimeUnreadCount] = useState<number | null>(null);
+
+  useNotificationHub(currentUser?.id, isCheckingSession, setNotifications, setRealtimeUnreadCount);
+
+  const [activities, setActivities] = useState<Activity[]>([]);
+  const [watchParties, setWatchParties] = useState<WatchParty[]>([]);
 
   // Books-related states
-  const [books, setBooks] = useState<Book[]>(MOCK_BOOKS);
-  const [bookCollections, setBookCollections] = useState<BookCollection[]>(MOCK_BOOK_COLLECTIONS);
-  const [bookVsMovies, setBookVsMovies] = useState<BookVsMovie[]>(MOCK_BOOK_VS_MOVIES);
+  const [books, setBooks] = useState<Book[]>([]);
+  const [bookCollections, setBookCollections] = useState<BookCollection[]>([]);
+  const [bookVsMovies, setBookVsMovies] = useState<BookVsMovie[]>([]);
+  const [homeRecommendations, setHomeRecommendations] = useState<{ movie: Movie; reason: string }[]>([]);
+  const [homeRecommendationsLoading, setHomeRecommendationsLoading] = useState(false);
   const [selectedBookIdForModal, setSelectedBookIdForModal] = useState<string | null>(null);
   const [activeBookIdForReader, setActiveBookIdForReader] = useState<string | null>(null);
 
@@ -107,11 +499,51 @@ export default function App() {
   const [mainScrollY, setMainScrollY] = useState<number>(0);
   const [favTab, setFavTab] = useState<'movies' | 'books'>('movies');
   const [watchlistTab, setWatchlistTab] = useState<'movies' | 'books'>('movies');
+  const [movieWatchHistory, setMovieWatchHistory] = useState<Movie[]>([]);
+  const [isMovieWatchHistoryLoading, setIsMovieWatchHistoryLoading] = useState(false);
+  const [movieWatchHistoryError, setMovieWatchHistoryError] = useState<string | null>(null);
+  const movieListTogglePendingRef = useRef<Set<string>>(new Set());
   const scrollFactor = Math.min(mainScrollY / 300, 1);
+
+  const loadMovieWatchHistory = useCallback(async () => {
+    setIsMovieWatchHistoryLoading(true);
+    setMovieWatchHistoryError(null);
+    try {
+      const res = await apiGetMovieHistory();
+      if (!Array.isArray(res)) {
+        throw new Error('İzləmə tarixi cavabı düzgün formatda deyil.');
+      }
+
+      const seen = new Set<string>();
+      const mapped = res
+        .map(mapBackendMovie)
+        .filter((movie) => {
+          if (!movie.id || seen.has(movie.id)) return false;
+          seen.add(movie.id);
+          return true;
+        });
+
+      setMovieWatchHistory(mapped);
+    } catch (err: any) {
+      setMovieWatchHistoryError(err?.message || 'İzləmə tarixi yüklənə bilmədi.');
+    } finally {
+      setIsMovieWatchHistoryLoading(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    if (!currentUser?.id) {
+      setMovieWatchHistory([]);
+      setMovieWatchHistoryError(null);
+      setIsMovieWatchHistoryLoading(false);
+      return;
+    }
+
+    void loadMovieWatchHistory();
+  }, [currentUser?.id, loadMovieWatchHistory]);
 
   // Loading & Skeleton Loader states
   const [isViewLoading, setIsViewLoading] = useState<boolean>(false);
-  const [isMoviesFilterLoading, setIsMoviesFilterLoading] = useState<boolean>(false);
 
   // Trigger smooth shimmer skeleton on view switch
   useEffect(() => {
@@ -122,7 +554,46 @@ export default function App() {
     return () => clearTimeout(timer);
   }, [currentView, selectedMovie]);
 
-  const targetProfileUser = selectedProfileUser || currentUser || MOCK_USERS[0];
+  useEffect(() => {
+    if (currentView !== 'watch-history' || !currentUser?.id) return;
+    void loadMovieWatchHistory();
+  }, [currentView, currentUser?.id, loadMovieWatchHistory]);
+
+  useEffect(() => {
+    if (!currentUser?.id || currentView !== 'social') {
+      setSocialUserResults([]);
+      return;
+    }
+
+    const query = socialUserSearch.trim();
+    if (query.length < 2) {
+      setSocialUserResults([]);
+      setSocialUserSearchLoading(false);
+      return;
+    }
+
+    let isCancelled = false;
+    setSocialUserSearchLoading(true);
+
+    const timer = setTimeout(async () => {
+      try {
+        const res = await apiGlobalSearch(query, 20);
+        if (isCancelled) return;
+        setSocialUserResults(Array.isArray(res?.users) ? res.users : []);
+      } catch {
+        if (!isCancelled) setSocialUserResults([]);
+      } finally {
+        if (!isCancelled) setSocialUserSearchLoading(false);
+      }
+    }, 350);
+
+    return () => {
+      isCancelled = true;
+      clearTimeout(timer);
+    };
+  }, [currentUser?.id, currentView, socialUserSearch]);
+
+  const targetProfileUser = selectedProfileUser || currentUser;
 
   // Platform statistics state (fetches from /api/Stats with dynamic fallback)
   const [platformStats, setPlatformStats] = useState<{ onlineCount: number; totalReviews: number; activeRoomsCount: number }>({
@@ -130,6 +601,117 @@ export default function App() {
     totalReviews: 1894,
     activeRoomsCount: 2
   });
+
+  // Real filmləri backend-dən yüklə (mock data-nı əvəz edir)
+useEffect(() => {
+  let isMounted = true;
+
+  const loadMoviesFromBackend = async () => {
+    try {
+      const response = await apiGetMovies({ pageNumber: 1, pageSize: 100 });
+      const backendMovies = Array.isArray(response) ? response : (response as any)?.items;
+
+      if (isMounted && Array.isArray(backendMovies) && backendMovies.length > 0) {
+        setMovies(backendMovies.map(mapBackendMovie));
+      }
+    } catch (err) {
+      console.warn('Backend-dən filmlər yüklənə bilmədi, mock data istifadə olunur:', err);
+    }
+  };
+  loadMoviesFromBackend();
+  return () => { isMounted = false; };
+}, []);
+
+useEffect(() => {
+  if (!currentUser?.id) {
+    setHomeRecommendations([]);
+    return;
+  }
+
+  let cancelled = false;
+
+  const loadHomeRecommendations = async () => {
+    setHomeRecommendationsLoading(true);
+    try {
+      const favCount = (currentUser.favorites?.length || 0) + (currentUser.watchlist?.length || 0);
+      const prompt = favCount > 0
+        ? 'Mənim sevimli filmlərimə əsasən mənə 4 film tövsiyə et.'
+        : 'Mənə 4 populyar və yüksək reytinqli film tövsiyə et.';
+
+      const aiRes = await apiAskAiChat(prompt);
+      const recommendedIds = aiRes.recommendedMovieIds || [];
+      let recMovies: Movie[] = recommendedIds
+        .map((id) => movies.find((m) => m.id === id))
+        .filter((m): m is Movie => !!m)
+        .slice(0, 4);
+
+      if (recMovies.length < 4) {
+        const response = await apiGetMovies({ isTrending: true, pageSize: 4 });
+        const backendMovies = Array.isArray(response) ? response : (response as any)?.items;
+        if (Array.isArray(backendMovies)) {
+          const trendingMovies = backendMovies
+            .map(mapBackendMovie)
+            .filter((m) => !recMovies.some((r) => r.id === m.id));
+          recMovies = [...recMovies, ...trendingMovies].slice(0, 4);
+        }
+      }
+
+      if (!cancelled) {
+        setHomeRecommendations(
+          recMovies.map((movie) => ({
+            movie,
+            reason: recommendedIds.includes(movie.id) ? 'CineAI tövsiyəsi' : 'İcma tərəfindən trend',
+          }))
+        );
+      }
+    } catch (err) {
+      console.warn('AI tövsiyələri yüklənə bilmədi, trend filmlərə keçilir:', err);
+      try {
+        const response = await apiGetMovies({ isTrending: true, pageSize: 4 });
+        const backendMovies = Array.isArray(response) ? response : (response as any)?.items;
+        if (!cancelled && Array.isArray(backendMovies)) {
+          setHomeRecommendations(
+            backendMovies.map(mapBackendMovie).slice(0, 4).map((movie) => ({
+              movie,
+              reason: 'İcma tərəfindən trend',
+            }))
+          );
+        }
+      } catch {
+        if (!cancelled) setHomeRecommendations([]);
+      }
+    } finally {
+      if (!cancelled) setHomeRecommendationsLoading(false);
+    }
+  };
+
+  loadHomeRecommendations();
+  return () => { cancelled = true; };
+}, [currentUser?.id, currentUser?.favorites?.length, currentUser?.watchlist?.length, movies.length]);
+
+useEffect(() => {
+  let isMounted = true;
+
+  const loadBooksFromBackend = async () => {
+    try {
+      const response = await apiGetBooks({ pageNumber: 1, pageSize: 100 });
+      const backendBooks = Array.isArray(response) ? response : (response as any)?.items;
+
+      if (isMounted && Array.isArray(backendBooks) && backendBooks.length > 0) {
+        setBooks(backendBooks.map(mapBackendBook));
+      }
+    } catch (err) {
+      console.warn('Backend-dən kitablar yüklənə bilmədi:', err);
+    }
+  };
+
+  loadBooksFromBackend();
+
+  return () => {
+    isMounted = false;
+  };
+}, []);
+
 
   useEffect(() => {
     let isMounted = true;
@@ -168,7 +750,7 @@ export default function App() {
     const fetchActivities = async () => {
       try {
         const streamData = await apiGetActivityStream(24);
-        if (isMounted && Array.isArray(streamData) && streamData.length > 0) {
+        if (isMounted && Array.isArray(streamData)) {
           const formattedStream: Activity[] = streamData.map((item: any) => ({
             id: item.id || `act-${Math.random()}`,
             userId: item.userId || 'u-unknown',
@@ -178,14 +760,9 @@ export default function App() {
             text: item.text || item.description || 'platformada aktivlik etdi',
             movieId: item.movieId,
             movieTitle: item.movieTitle,
-            createdAt: item.createdAt ? new Date(item.createdAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : 'İndi'
+            date: item.createdAt ? new Date(item.createdAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : 'İndi',
           }));
-          setActivities((prev) => {
-            const combined = [...formattedStream, ...prev];
-            const uniqueMap = new Map();
-            combined.forEach(act => uniqueMap.set(act.id, act));
-            return Array.from(uniqueMap.values());
-          });
+          setActivities(formattedStream);
         }
       } catch (e) {
         // Fallback to local state activities if backend endpoint is unavailable
@@ -248,6 +825,10 @@ export default function App() {
   const [socialModalType, setSocialModalType] = useState<'followers' | 'following'>('followers');
   const [socialModalUser, setSocialModalUser] = useState<User | null>(null);
   const [socialSearchQuery, setSocialSearchQuery] = useState<string>('');
+  const [socialLiveUsers, setSocialLiveUsers] = useState<any[]>([]);
+  const [isSocialLoading, setIsSocialLoading] = useState<boolean>(false);
+  const [socialModalFollowersCount, setSocialModalFollowersCount] = useState(0);
+  const [socialModalFollowingCount, setSocialModalFollowingCount] = useState(0);
 
   const socialUsersList = users.filter(u => {
     if (!socialModalUser) return false;
@@ -265,14 +846,105 @@ export default function App() {
     return true;
   });
 
+
+  const applySocialStatsToUser = (
+    userId: string,
+    followersList: any[],
+    followingList: any[],
+  ) => {
+    const followersIds = followersList.map((u) => u.id).filter(Boolean);
+    const followingIds = followingList.map((u) => u.id).filter(Boolean);
+    const patch = {
+      followers: followersIds,
+      following: followingIds,
+      followersCount: followersIds.length,
+      followingCount: followingIds.length,
+    };
+
+    setSocialModalUser((prev) => (prev?.id === userId ? { ...prev, ...patch } : prev));
+    setCurrentUser((prev) => (prev?.id === userId ? { ...prev, ...patch } : prev));
+    setSelectedProfileUser((prev) => (prev?.id === userId ? { ...prev, ...patch } : prev));
+    setUsers((prev) => prev.map((u) => (u.id === userId ? { ...u, ...patch } : u)));
+    setSocialModalFollowersCount(followersIds.length);
+    setSocialModalFollowingCount(followingIds.length);
+  };
+
+useEffect(() => {
+  if (!showSocialModal || !socialModalUser?.id) {
+    setSocialLiveUsers([]);
+    setSocialModalFollowersCount(0);
+    setSocialModalFollowingCount(0);
+    socialListsCacheRef.current = null;
+    return;
+  }
+
+  const loadModalData = async () => {
+    setIsSocialLoading(true);
+    try {
+      if (socialSearchQuery.trim().length >= 2) {
+        const searchResult = await apiGlobalSearch(socialSearchQuery.trim(), 30);
+        setSocialLiveUsers(searchResult?.users ?? []);
+        return;
+      }
+
+      let followersList: any[];
+      let followingList: any[];
+
+      if (socialListsCacheRef.current?.userId === socialModalUser.id) {
+        followersList = socialListsCacheRef.current.followers;
+        followingList = socialListsCacheRef.current.following;
+      } else {
+        const [followersRes, followingRes] = await Promise.all([
+          apiGetFollowers(socialModalUser.id),
+          apiGetFollowing(socialModalUser.id),
+        ]);
+        followersList = Array.isArray(followersRes) ? followersRes : [];
+        followingList = Array.isArray(followingRes) ? followingRes : [];
+        socialListsCacheRef.current = {
+          userId: socialModalUser.id,
+          followers: followersList,
+          following: followingList,
+        };
+        applySocialStatsToUser(socialModalUser.id, followersList, followingList);
+      }
+
+      setSocialModalFollowersCount(followersList.length);
+      setSocialModalFollowingCount(followingList.length);
+      setSocialLiveUsers(
+        socialModalType === 'followers' ? followersList : followingList
+      );
+    } catch (err) {
+      console.error('Sosial modal verisi yüklənərkən xəta:', err);
+      setSocialLiveUsers([]);
+    } finally {
+      setIsSocialLoading(false);
+    }
+  };
+
+  const delayTimer = setTimeout(() => {
+    loadModalData();
+  }, 300);
+
+  return () => clearTimeout(delayTimer);
+}, [showSocialModal, socialModalType, socialModalUser?.id, socialSearchQuery]);
+
+
   // Edit profile form state
   const [editName, setEditName] = useState('');
   const [editUsername, setEditUsername] = useState('');
   const [editBio, setEditBio] = useState('');
   const [editAvatar, setEditAvatar] = useState('');
+  const [editCurrentPassword, setEditCurrentPassword] = useState('');
+  const [editNewPassword, setEditNewPassword] = useState('');
+  const [editConfirmPassword, setEditConfirmPassword] = useState('');
+  const [passwordChangeError, setPasswordChangeError] = useState<string | null>(null);
+  const [passwordChangeSuccess, setPasswordChangeSuccess] = useState<string | null>(null);
+  const [isChangingPassword, setIsChangingPassword] = useState(false);
 
   // Create party form state
   const [newPartyName, setNewPartyName] = useState('');
+  const [newPartyIsPrivate, setNewPartyIsPrivate] = useState(false);
+  const [newPartyIsPremium, setNewPartyIsPremium] = useState(false);
   const [newPartyMovieId, setNewPartyMovieId] = useState('');
   const [useExternalMovie, setUseExternalMovie] = useState<boolean>(false);
   const [externalMovieTitle, setExternalMovieTitle] = useState('');
@@ -408,6 +1080,13 @@ export default function App() {
   // Video Ref
   const videoRef = useRef<HTMLVideoElement>(null);
   const hasAutoJoined = useRef<boolean>(false);
+  const pendingPartyRouteRef = useRef(parseWatchPartyRoute());
+  const [guestPartyPreview, setGuestPartyPreview] = useState<RoomPreviewDto | null>(null);
+  const [guestPartyPreviewLoading, setGuestPartyPreviewLoading] = useState(
+    () => !!parseWatchPartyRoute().partyId,
+  );
+  const followPendingRef = useRef<Set<string>>(new Set());
+  const socialListsCacheRef = useRef<{ userId: string; followers: any[]; following: any[] } | null>(null);
 
   // Reset player when switching movies or views
   useEffect(() => {
@@ -422,18 +1101,70 @@ export default function App() {
   const [selectedGenre, setSelectedGenre] = useState('Hamsı');
   const [selectedYear, setSelectedYear] = useState('Hamsı');
   const [selectedRating, setSelectedRating] = useState('Hamsı');
-  const [selectedSort, setSelectedSort] = useState('rating-desc'); // rating-desc, year-desc, likes-desc
+  const [selectedSort, setSelectedSort] = useState('rating-desc');
+  const [moviesListResults, setMoviesListResults] = useState<Movie[]>([]);
+  const [moviesListPage, setMoviesListPage] = useState(1);
+  const [moviesListHasMore, setMoviesListHasMore] = useState(false);
+  const [isMoviesListLoading, setIsMoviesListLoading] = useState(false);
 
-  // Trigger brief shimmer loading state on movie filter updates
   useEffect(() => {
-    if (currentView === 'movies') {
-      setIsMoviesFilterLoading(true);
-      const timer = setTimeout(() => {
-        setIsMoviesFilterLoading(false);
-      }, 300);
-      return () => clearTimeout(timer);
+    if (currentView !== 'movies') return;
+
+    let isCancelled = false;
+    setIsMoviesListLoading(true);
+    setMoviesListPage(1);
+
+    const timer = setTimeout(async () => {
+      try {
+        const response = await apiGetMovies({
+          pageNumber: 1,
+          pageSize: MOVIES_PAGE_SIZE,
+          searchTerm: movieSearch.trim() || undefined,
+          genre: selectedGenre,
+          yearFilter: selectedYear,
+          ratingFilter: selectedRating,
+          sortBy: selectedSort,
+        });
+        if (isCancelled) return;
+
+        const backendMovies = Array.isArray(response) ? response : (response as any)?.items ?? [];
+        const mapped = backendMovies.map(mapBackendMovie);
+        setMoviesListResults(mapped);
+        setMoviesListHasMore(mapped.length >= MOVIES_PAGE_SIZE);
+      } catch {
+        if (!isCancelled) setMoviesListResults([]);
+      } finally {
+        if (!isCancelled) setIsMoviesListLoading(false);
+      }
+    }, 350);
+
+    return () => {
+      isCancelled = true;
+      clearTimeout(timer);
+    };
+  }, [currentView, movieSearch, selectedGenre, selectedYear, selectedRating, selectedSort]);
+
+  const handleLoadMoreMovies = async () => {
+    const nextPage = moviesListPage + 1;
+    try {
+      const response = await apiGetMovies({
+        pageNumber: nextPage,
+        pageSize: MOVIES_PAGE_SIZE,
+        searchTerm: movieSearch.trim() || undefined,
+        genre: selectedGenre,
+        yearFilter: selectedYear,
+        ratingFilter: selectedRating,
+        sortBy: selectedSort,
+      });
+      const backendMovies = Array.isArray(response) ? response : (response as any)?.items ?? [];
+      const mapped = backendMovies.map(mapBackendMovie);
+      setMoviesListResults((prev) => [...prev, ...mapped]);
+      setMoviesListPage(nextPage);
+      setMoviesListHasMore(mapped.length >= MOVIES_PAGE_SIZE);
+    } catch (err) {
+      console.warn('Filmlər səhifəsi yüklənmədi:', err);
     }
-  }, [movieSearch, selectedGenre, selectedYear, selectedRating, selectedSort]);
+  };
 
   // Review Form State
   const [reviewRating, setReviewRating] = useState<number>(10);
@@ -468,268 +1199,168 @@ export default function App() {
     }
   }, [currentUser]);
 
-  // Deep-linking support for invite links (?party=ID or /watch-party/ID)
+  // Guest preview for /watch-party/{id} deep links (no login required)
   useEffect(() => {
-    if (hasAutoJoined.current) return;
+    if (currentUser) return;
+    const route = parseWatchPartyRoute();
+    pendingPartyRouteRef.current = route;
+    if (!route.partyId || !isBackendRoomId(route.partyId)) {
+      setGuestPartyPreview(null);
+      setGuestPartyPreviewLoading(false);
+      return;
+    }
 
-    const pathname = window.location.pathname;
-    const searchParams = new URLSearchParams(window.location.search);
-    let partyId = searchParams.get('party');
-
-    if (!partyId && pathname.includes('/watch-party/')) {
-      const parts = pathname.split('/watch-party/');
-      if (parts.length > 1) {
-        partyId = parts[1].split('/')[0];
+    let cancelled = false;
+    setGuestPartyPreviewLoading(true);
+    (async () => {
+      try {
+        const preview = await apiGetRoomById(route.partyId!, route.inviteToken ?? undefined);
+        if (!cancelled) setGuestPartyPreview(preview);
+      } catch {
+        if (!cancelled) setGuestPartyPreview(null);
+      } finally {
+        if (!cancelled) setGuestPartyPreviewLoading(false);
       }
-    }
+    })();
 
-    if (partyId) {
-      const foundParty = watchParties.find(wp => wp.id === partyId);
-      if (foundParty) {
-        hasAutoJoined.current = true; // Mark as processed to prevent any loop
-        
-        // Handle guest session if not logged in
-        let activeUser = currentUser;
-        if (!activeUser) {
-          const guestUser: User = {
-            id: 'u_guest_' + Date.now(),
-            name: 'Qonaq İzləyici',
-            username: 'qonaq_' + Math.floor(100 + Math.random() * 900),
-            avatar: 'https://images.unsplash.com/photo-1535713875002-d1d0cf377fde?w=100&auto=format&fit=crop&q=80',
-            email: 'guest@cineverse.com',
-            role: 'user',
-            bio: 'CineVerse Dəvətlisi',
-            followersCount: 0,
-            followingCount: 0,
-            favorites: [],
-            watchlist: [],
-            savedCollections: [],
-            followers: [],
-            following: []
-          };
-          setCurrentUser(guestUser);
-          activeUser = guestUser;
-        }
+    return () => { cancelled = true; };
+  }, [currentUser]);
 
-        const exists = foundParty.participants.some((p) => p.id === activeUser!.id);
-        let updatedParticipants = [...foundParty.participants];
-        if (!exists) {
-          updatedParticipants.push({
-            id: activeUser!.id,
-            name: activeUser!.name,
-            avatar: activeUser!.avatar
-          });
-        }
+  const joinPartyFromRoute = useCallback(async (route = parseWatchPartyRoute()) => {
+    if (!route.partyId || !isBackendRoomId(route.partyId)) return false;
 
-        const updatedParty = {
-          ...foundParty,
-          participants: updatedParticipants,
-          chat: [
-            ...foundParty.chat,
-            {
-              id: 'sys_join_' + Date.now(),
-              sender: 'Sistem',
-              senderAvatar: '',
-              message: `${activeUser!.name} dəvət linki vasitəsilə otağa sürətlə qoşuldu! 👋🍿`,
-              timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
-            }
-          ]
-        };
-
-        setWatchParties((prev) => prev.map((p) => (p.id === foundParty.id ? updatedParty : p)));
-        setActiveWatchParty(updatedParty);
-        setCurrentView('watch-party-room');
+    try {
+      if (route.inviteToken) {
+        await apiJoinRoomWithInviteToken(route.partyId, route.inviteToken);
       }
-    }
-  }, [watchParties, currentUser]);
 
-  // AI-powered recommendation system
-  const getAIRecommendations = (): { movie: Movie; score: number; reason: string }[] => {
-    if (!currentUser) return [];
+      const preview = await apiGetRoomById(route.partyId, route.inviteToken ?? undefined);
+      if (!preview.canJoinWithAuth) {
+        if (preview.isPremium) {
+          toast.error('Bu Premium otağa qoşulmaq üçün abunəlik lazımdır.');
+          setShowPremiumModal(true);
+        } else {
+          toast.error('Bu otağa qoşulmaq üçün etibarlı dəvət linki lazımdır.');
+        }
+        return false;
+      }
 
-    const favoriteMovies = movies.filter(m => currentUser.favorites.includes(m.id) || currentUser.watchlist.includes(m.id));
-
-    // If user has no favorites or watchlist, return top 4 high-rated movies as recommendations
-    if (favoriteMovies.length === 0) {
-      return movies
-        .filter(m => m.id !== 'm_ext_') // skip custom external movies
-        .sort((a, b) => b.rating - a.rating)
-        .slice(0, 4)
-        .map(m => ({
-          movie: m,
-          score: m.rating,
-          reason: "İcma tərəfindən yüksək qiymətləndirilib"
-        }));
-    }
-
-    // Calculate genre and director frequency
-    const genreCounts: { [key: string]: number } = {};
-    const directorCounts: { [key: string]: number } = {};
-
-    favoriteMovies.forEach(m => {
-      m.genres.forEach(g => {
-        genreCounts[g] = (genreCounts[g] || 0) + 1;
+      const party = mapPreviewToWatchParty(preview);
+      setWatchParties((prev) => {
+        const existing = prev.find((p) => p.id === party.id);
+        if (existing) {
+          return prev.map((p) => (p.id === party.id ? { ...party, chat: p.chat, inviteToken: party.inviteToken ?? p.inviteToken } : p));
+        }
+        return [party, ...prev];
       });
-      directorCounts[m.director] = (directorCounts[m.director] || 0) + 1;
-    });
+      setActiveWatchParty(party);
+      setCurrentView('watch-party-room');
+      syncWatchPartyUrl(party.id, route.inviteToken ?? party.inviteToken);
+      hasAutoJoined.current = true;
+      return true;
+    } catch (err: any) {
+      toast.error(err?.message || 'Otağa qoşulmaq mümkün olmadı.');
+      return false;
+    }
+  }, [setShowPremiumModal]);
 
-    // Score all non-favorited movies
-    const recommended = movies
-      .filter(m => !currentUser.favorites.includes(m.id) && !currentUser.watchlist.includes(m.id))
-      .map(m => {
-        let score = 0;
-        let reasons: string[] = [];
+  // Deep-linking: logged-in users auto-join /watch-party/{id}
+  useEffect(() => {
+    if (!currentUser || hasAutoJoined.current) return;
 
-        // Genre matching points
-        let matchedGenres = m.genres.filter(g => genreCounts[g] > 0);
-        matchedGenres.forEach(g => {
-          score += genreCounts[g] * 4;
-        });
+    const route = parseWatchPartyRoute();
+    if (!route.partyId) return;
 
-        if (matchedGenres.length > 0) {
-          reasons.push(`Sevdiyniz "${matchedGenres[0]}" janrında`);
-        }
+    const foundParty = watchParties.find((wp) => wp.id === route.partyId);
+    if (foundParty) {
+      if (
+        foundParty.isPremium
+        && !currentUser.isPremium
+        && !isRoomHost(foundParty, currentUser)
+        && currentUser.role !== 'admin'
+      ) {
+        toast.error('Bu Premium otağa qoşulmaq üçün abunəlik lazımdır.');
+        setShowPremiumModal(true);
+        hasAutoJoined.current = true;
+        return;
+      }
+      hasAutoJoined.current = true;
+      setActiveWatchParty(foundParty);
+      setCurrentView('watch-party-room');
+      syncWatchPartyUrl(foundParty.id, route.inviteToken ?? foundParty.inviteToken);
+      if (route.inviteToken) {
+        apiJoinRoomWithInviteToken(route.partyId, route.inviteToken).catch(() => {});
+      }
+      return;
+    }
 
-        // Director matching points
-        if (directorCounts[m.director] > 0) {
-          score += directorCounts[m.director] * 10;
-          reasons.push(`Sevdiyniz rejissor ${m.director}-dan`);
-        }
+    void joinPartyFromRoute(route);
+  }, [watchParties, currentUser, joinPartyFromRoute]);
 
-        // Base rating score component
-        score += m.rating * 1.5;
-
-        // Reason formulation
-        let reason = reasons.join(' və ') || "Maraqlana biləcəyiniz janr";
-
-        return {
-          movie: m,
-          score,
-          reason
-        };
-      })
-      .sort((a, b) => b.score - a.score)
-      .slice(0, 4);
-
-    return recommended;
-  };
-
-  const handleSendChatbotMessage = (text: string) => {
-    if (!text.trim() || isChatbotTyping) return;
+  const handleSendChatbotMessage = async (text: string) => {
+    const trimmed = text.trim();
+    if (!trimmed || isChatbotTyping) return;
 
     const userMsg = {
       id: 'msg_user_' + Date.now(),
       sender: 'user' as const,
-      text: text.trim()
+      text: trimmed,
     };
 
-    setChatbotMessages(prev => [...prev, userMsg]);
+    setChatbotMessages((prev) => [...prev, userMsg]);
     setChatbotInput('');
     setIsChatbotTyping(true);
 
-    // Simulate AI thinking and reply
-    setTimeout(() => {
-      const lowerText = text.toLowerCase();
-      let replyText = "";
-      let recommendedMovieIds: string[] = [];
-      let recommendedBookIds: string[] = [];
+    try {
+      const data = await apiAskAiChat(trimmed) as {
+        reply?: string;
+        text?: string;
+        response?: string;
+        recommendedMovieIds?: string[];
+        recommendedBookIds?: string[];
+      };
 
-      if (lowerText.includes('dyun') || lowerText.includes('dune')) {
-        replyText = `**Dyun (Dune)** – Frank Herbertin əfsanəvi elmi-fantastik şahəsəridir. CineVerse-in xüsusi e-oxuyucusu vasitəsilə kitabı dərhal buradan oxuya bilərsən! Kitabı oxuduqca əlavə Kino Xalları (points) qazanacaqsan! 📖🌌`;
-        recommendedBookIds = ['b1'];
-      } else if (lowerText.includes('əli və nino') || lowerText.includes('ali və nino') || lowerText.includes('ali and nino') || lowerText.includes('nino')) {
-        replyText = `**Əli və Nino** – Qurban Səidin Bakıda cərəyan edən klassik sevgi və tarix dastanını birbaşa CineVerse rəqəmsal oxuyucusunda mütaliə edin! 🌹📖`;
-        recommendedBookIds = ['b2'];
-      } else if (lowerText.includes('təmiz kod') || lowerText.includes('clean code') || lowerText.includes('robert martin') || lowerText.includes('martin')) {
-        replyText = `Proqramlaşdırma dünyasının stolüstü kitabı – **Clean Code (Təmiz Kod)**. Hər bir peşəkar proqramçının mütləq oxumalı olduğu bu əsəri CineVerse E-Reader-də oxu! 💻📚`;
-        recommendedBookIds = ['b3'];
-      } else if (lowerText.includes('1984') || lowerText.includes('orwell') || lowerText.includes('oruell')) {
-        replyText = `Corc Oruell tərəfindən yazılmış dahi antiutopik əsər **"1984"** romanını buradan oxuya və totalitar bir cəmiyyətin dərinliklərinə enə bilərsən: 👁️📖`;
-        recommendedBookIds = ['b4'];
-      } else if (lowerText.includes('kitab') || lowerText.includes('roman') || lowerText.includes('oxu') || lowerText.includes('book') || lowerText.includes('müəllif') || lowerText.includes('yazar') || lowerText.includes('yazıçı') || lowerText.includes('kitablar')) {
-        replyText = `CineVerse rəqəmsal kitabxanasına xoş gəldin! Sənin üçün sistemdə olan ən populyar və reytinqli kitabları topladım. E-Reader (E-Oxuyucu) vasitəsilə mütaliə edərək həm də Kino Xalları qazana bilərsən! 📚✨`;
-        recommendedBookIds = books.slice(0, 4).map(b => b.id);
-      } else if (lowerText.includes('nolan')) {
-        const nolanMovies = movies.filter(m => m.director.toLowerCase().includes('nolan'));
-        if (nolanMovies.length > 0) {
-          replyText = `Christopher Nolan həqiqətən də kino sənətinin dahisidir! Sənin üçün sistemimizdə olan ən yaxşı Nolan şahəsərlərini tapdım. Onların ssenari quruluşu və fəlsəfəsi səni heyran edəcək! 🌌🍿`;
-          recommendedMovieIds = nolanMovies.map(m => m.id);
-        } else {
-          replyText = `Nolan filmləri olduqca dərindir! Təəssüf ki, hazırda verilənlər bazamızda tapılmadı, lakin sizə "Dyun" və ya digər elmi-fantastik filmləri tövsiyə edə bilərəm!`;
-        }
-      } else if (lowerText.includes('fantastika') || lowerText.includes('elm') || lowerText.includes('kosmos') || lowerText.includes('sci-fi') || lowerText.includes('scifi')) {
-        const sciFiMovies = movies.filter(m => m.genres.some(g => g.toLowerCase().includes('fantastika') || g.toLowerCase().includes('elm')));
-        if (sciFiMovies.length > 0) {
-          replyText = `Elmi-Fantastika janrına olan sevginiz möhtəşəmdir! Kosmos, zaman səyahəti və texnologiya mövzulu bu möhtəşəm filmlərə göz atmağınızı tövsiyə edirəm: 🛸✨`;
-          recommendedMovieIds = sciFiMovies.map(m => m.id);
-        } else {
-          replyText = `Elmi-fantastik filmlər həmişə diqqətçəkəndir! Sistemimizdə bənzər filmləri axtarıram.`;
-        }
-      } else if (lowerText.includes('dram') || lowerText.includes('həyat') || lowerText.includes('hekayə')) {
-        const dramMovies = movies.filter(m => m.genres.some(g => g.toLowerCase().includes('dram')));
-        if (dramMovies.length > 0) {
-          replyText = `Dərin hisslər, guclü hekayələr və təsirli obrazlar axtarırsınız? Bu dram filmləri sizi həm düşündürəcək, həm də duyğulandıracaq: 🎭🥺`;
-          recommendedMovieIds = dramMovies.slice(0, 3).map(m => m.id);
-        }
-      } else if (lowerText.includes('triller') || lowerText.includes('sirr') || lowerText.includes('gərginlik')) {
-        const thrillerMovies = movies.filter(m => m.genres.some(g => g.toLowerCase().includes('triller') || g.toLowerCase().includes('sirr')));
-        if (thrillerMovies.length > 0) {
-          replyText = `Gərginlik dolu dəqiqələr və tapmacalar! Son ana qədər nəfəsinizi kəsəcək ən güclü triller filmlərini sizin üçün seçdim: 🕵️‍♂️🔥`;
-          recommendedMovieIds = thrillerMovies.slice(0, 3).map(m => m.id);
-        }
-      } else if (lowerText.includes('aksiyon') || lowerText.includes('döyüş') || lowerText.includes('macəra') || lowerText.includes('adventure')) {
-        const actionMovies = movies.filter(m => m.genres.some(g => g.toLowerCase().includes('aksiyon') || g.toLowerCase().includes('macəra') || g.toLowerCase().includes('aksion')));
-        if (actionMovies.length > 0) {
-          replyText = `Adrenalin və macəra axtarırsınız? Sürətli templi, hərəkətli və macəra dolu bu filmləri qətiyyən qaçırmayın: 🏹💥`;
-          recommendedMovieIds = actionMovies.slice(0, 3).map(m => m.id);
-        }
-      } else if (lowerText.includes('təsadüfi') || lowerText.includes('random') || lowerText.includes('film təklif') || lowerText.includes('təklif et') || lowerText.includes('tövsiyə')) {
-        const randomIndex = Math.floor(Math.random() * movies.length);
-        const randomMovie = movies[randomIndex];
-        replyText = `Sənin bəxtinə bu gün şanslı bir film çıxdı! **"${randomMovie.title}"** sənə xoş anlar bəxş edə bilər. Rejissor ${randomMovie.director} tərəfindən çəkilmiş bu film ${randomMovie.year}-cu ilə aiddir. Buna mütləq şans ver! 🍿🎲`;
-        recommendedMovieIds = [randomMovie.id];
-      } else if (lowerText.includes('salam') || lowerText.includes('salamlar') || lowerText.includes('hey') || lowerText.includes('hello')) {
-        replyText = `Salam, xoş gəldiniz! 😊 Mən CineAI-yam. Sizin film və kitab zövqünüzə uyğun gələcək xüsusi təkliflər etmək üçün buradayam. Mənə necə bir film və ya kitab istədiyinizi deyin (məsələn: Nolan, Dyun, Triller, Elmi-fantastika, Əli və Nino və s.).`;
-      } else if (lowerText.includes('reytinq') || lowerText.includes('ən yaxşı') || lowerText.includes('yüksək')) {
-        const bestMovies = [...movies].sort((a, b) => b.rating - a.rating).slice(0, 3);
-        replyText = `CineVerse icması və tənqidçilər tərəfindən ən yüksək reytinq almış, mütləq izlənməli olan TOP 3 film bunlardır: 🏆⭐`;
-        recommendedMovieIds = bestMovies.map(m => m.id);
-      } else if (lowerText.includes('özəl') || lowerText.includes('mənim üçün') || lowerText.includes('seçilmiş')) {
-        const recs = getAIRecommendations();
-        if (recs.length > 0) {
-          replyText = `Sənin üçün xüsusi olaraq hazırladığım "Özəl Təkliflər" siyahısını buraya gətirdim. Sevdiyin janrlara və rejissorlara əsaslanır: 🌟🤖`;
-          recommendedMovieIds = recs.map(r => r.movie.id);
-        } else {
-          replyText = `Zövqünüzü öyrənmək üçün hələ yetərli məlumatım yoxdur. Zəhmət olmasa bir neçə filmi sevimliyə əlavə edin!`;
-        }
-      } else {
-        const matched = movies.filter(m => lowerText.includes(m.title.toLowerCase()) || lowerText.includes(m.originalTitle.toLowerCase()));
-        if (matched.length > 0) {
-          replyText = `Bəli, **"${matched[0].title}"** həqiqətən əla seçimdir! Rejissor ${matched[0].director} imzalı bu film haqqında ətraflı məlumata baxmaq istəyirsinizsə, aşağıda klikləyin: 👇`;
-          recommendedMovieIds = [matched[0].id];
-        } else {
-          replyText = `Maraqlı fikirdir! Sənin üçün sistemdə olan ən populyar film və kitablarımızdan bəzilərini seçdim. Bəlkə bu axşam bunlardan birinə vaxt ayırasan? 🎬🍿📚`;
-          recommendedMovieIds = movies.slice(0, 2).map(m => m.id);
-          recommendedBookIds = books.slice(0, 2).map(b => b.id);
-        }
-      }
+      const replyText =
+        data.reply?.trim() ||
+        data.text?.trim() ||
+        data.response?.trim() ||
+        'Cavab alına bilmədi.';
 
       const aiMsg = {
         id: 'msg_ai_' + Date.now(),
         sender: 'ai' as const,
         text: replyText,
-        recommendedMovieIds,
-        recommendedBookIds
+        recommendedMovieIds: (data.recommendedMovieIds ?? []).map(String),
+        recommendedBookIds: (data.recommendedBookIds ?? []).map(String),
       };
 
-      setChatbotMessages(prev => [...prev, aiMsg]);
+      setChatbotMessages((prev) => [...prev, aiMsg]);
+    } catch (err: any) {
+      const aiErrorMsg = {
+        id: 'msg_ai_err_' + Date.now(),
+        sender: 'ai' as const,
+        text:
+          err?.message ||
+          'CineAI hazırda cavab verə bilmir. Zəhmət olmasa bir az sonra yenidən cəhd edin.',
+      };
+      setChatbotMessages((prev) => [...prev, aiErrorMsg]);
+    } finally {
       setIsChatbotTyping(false);
-    }, 1200);
+    }
   };
 
   // Handle Login
-  const handleLoginSuccess = (user: User) => {
+  const handleLoginSuccess = async (user: User) => {
+    setNotifications([]);
+    setRealtimeUnreadCount(null);
     setCurrentUser(user);
+
+    const route = pendingPartyRouteRef.current;
+    if (route.partyId && isBackendRoomId(route.partyId)) {
+      const joined = await joinPartyFromRoute(route);
+      if (joined) return;
+    }
+
     if (user.role === 'admin') {
       setIsAdminMode(true);
       setCurrentView('admin');
@@ -740,37 +1371,56 @@ export default function App() {
   };
 
   // Handle Logout
-  const handleLogout = () => {
-    setCurrentUser(null);
-    setActiveWatchParty(null);
-    setSelectedMovie(null);
-    setIsAdminMode(false);
+  const handleLogout = async () => {
+    try {
+      await stopChatConnection();
+      await stopLiveStreamConnection();
+      await stopNotificationConnection();
+      await apiLogout();
+    } catch (err) {
+      console.warn('Logout zamanı xəta (token yenə də təmizlənir):', err);
+      removeAuthToken();
+    } finally {
+      setCurrentUser(null);
+      setActiveWatchParty(null);
+      setSelectedMovie(null);
+      setIsAdminMode(false);
+      setNotifications([]);
+      setRealtimeUnreadCount(null);
+      setFriends([]);
+      setPendingFriendRequests([]);
+      setInviteDirectory([]);
+      setCollections([]);
+      setSocialUserSearch('');
+      setSocialUserResults([]);
+      setMovieWatchHistory([]);
+      setMovieWatchHistoryError(null);
+      setIsMovieWatchHistoryLoading(false);
+    }
   };
 
-  // Add Kino Xalları (Gamification Points) to user
-  const rewardPoints = (amount: number, reason: string) => {
+  // Add Kino Xalları (Gamification Points) to user — real backend ilə sinxron
+  const rewardPoints = async (amount: number, reason: string) => {
     if (!currentUser) return;
     const currentPoints = currentUser.points || 0;
-    const newPoints = currentPoints + amount;
-    
-    const updatedUser = {
-      ...currentUser,
-      points: newPoints
-    };
-    
-    setCurrentUser(updatedUser);
-    setUsers(prev => prev.map(u => u.id === currentUser.id ? updatedUser : u));
+    const optimisticPoints = currentPoints + amount;
+    const optimisticBadge = getHighestBadgeForPoints(optimisticPoints).name;
 
-    // Add a system notification for the user
-    const newNotification: Notification = {
-      id: 'notif_pts_' + Date.now(),
-      type: 'system',
-      title: 'Xal Qazanıldı! 🏆',
-      description: `Təbrik edirik! +${amount} Kino Xalı qazandınız (${reason}). Sizin ümumi xalınız: ${newPoints}`,
-      date: 'İndi',
-      read: false
-    };
-    setNotifications(prev => [newNotification, ...prev]);
+    const optimisticUser = { ...currentUser, points: optimisticPoints, badge: optimisticBadge };
+    setCurrentUser(optimisticUser);
+    setUsers(prev => prev.map(u => u.id === currentUser.id ? optimisticUser : u));
+
+    // Backend-ə yazırıq və əsl balansla sinxronlaşdırırıq
+    try {
+      const res = await apiAddMyPoints(amount);
+      if (res && typeof res.points === 'number') {
+        const nextBadge = getHighestBadgeForPoints(res.points).name;
+        setCurrentUser(prev => (prev ? { ...prev, points: res.points, badge: nextBadge } : prev));
+        setUsers(prev => prev.map(u => u.id === currentUser.id ? { ...u, points: res.points, badge: nextBadge } : u));
+      }
+    } catch (err) {
+      console.warn('Kino Xalı backend-ə yazıla bilmədi, lokal dəyər saxlanılır:', err);
+    }
   };
 
   // Player Playback Functions
@@ -890,23 +1540,68 @@ export default function App() {
     return activeCue ? activeCue[lang] : '';
   };
 
-  // Handle Profile Update
-  const handleUpdateProfile = (e: React.FormEvent) => {
+  const handleChangePassword = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!currentUser || !editName.trim() || !editUsername.trim()) return;
+    if (!currentUser) return;
 
-    // clean username (must start with no @, only alphanumeric and underscores, e.g. like instagram nick)
-    const cleanedUsername = editUsername.trim().toLowerCase().replace(/[^a-z0-9_]/g, '');
+    setPasswordChangeError(null);
+    setPasswordChangeSuccess(null);
 
-    if (!cleanedUsername) return;
+    if (!editCurrentPassword || !editNewPassword) {
+      setPasswordChangeError('Cari və yeni şifrə xanalarını doldurun.');
+      return;
+    }
+    if (editNewPassword.length < 6) {
+      setPasswordChangeError('Yeni şifrə ən azı 6 simvol olmalıdır.');
+      return;
+    }
+    if (editNewPassword !== editConfirmPassword) {
+      setPasswordChangeError('Yeni şifrə və təsdiq uyğun gəlmir.');
+      return;
+    }
 
-    // Update current user
+    setIsChangingPassword(true);
+    try {
+      await apiChangePassword({
+        currentPassword: editCurrentPassword,
+        newPassword: editNewPassword,
+      });
+      setPasswordChangeSuccess('Şifrəniz uğurla yeniləndi.');
+      setEditCurrentPassword('');
+      setEditNewPassword('');
+      setEditConfirmPassword('');
+    } catch (err: any) {
+      setPasswordChangeError(err?.message || 'Şifrə yenilənərkən xəta baş verdi.');
+    } finally {
+      setIsChangingPassword(false);
+    }
+  };
+
+  // Handle Profile Update
+  const handleUpdateProfile = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!currentUser || !editName.trim()) return;
+
+    const avatarUrl =
+      editAvatar.trim() ||
+      'https://images.unsplash.com/photo-1535713875002-d1d0cf377fde?w=100&auto=format&fit=crop&q=80';
+
+    try {
+      await apiUpdateProfile({
+        fullName: editName.trim(),
+        avatar: avatarUrl,
+        bio: editBio.trim(),
+      });
+    } catch (err) {
+      console.warn('Profil backend-ə yazıla bilmədi:', err);
+      return;
+    }
+
     const updatedUser: User = {
       ...currentUser,
       name: editName.trim(),
-      username: cleanedUsername,
       bio: editBio.trim(),
-      avatar: editAvatar.trim() || 'https://images.unsplash.com/photo-1535713875002-d1d0cf377fde?w=100&auto=format&fit=crop&q=80'
+      avatar: avatarUrl,
     };
 
     setCurrentUser(updatedUser);
@@ -932,7 +1627,6 @@ export default function App() {
 
       return {
         ...party,
-        creator: party.creator === currentUser.username ? updatedUser.username : party.creator,
         participants: updatedParticipants,
         chat: updatedChat
       };
@@ -941,7 +1635,7 @@ export default function App() {
     // Update activities
     setActivities((prev) => prev.map((act) => {
       if (act.userId === currentUser.id) {
-        return { ...act, username: updatedUser.username, userAvatar: updatedUser.avatar };
+        return { ...act, userAvatar: updatedUser.avatar };
       }
       return act;
     }));
@@ -951,7 +1645,7 @@ export default function App() {
       if (!m.reviews) return m;
       const updatedReviews = m.reviews.map((r) => {
         if (r.userId === currentUser.id) {
-          return { ...r, username: updatedUser.username, userAvatar: updatedUser.avatar };
+          return { ...r, userAvatar: updatedUser.avatar };
         }
         return r;
       });
@@ -967,12 +1661,12 @@ export default function App() {
     let isSubscribed = true;
     async function loadMovieReviews() {
       try {
-        const backendReviews = await apiGetReviewsByMovieId(selectedMovie.id);
+        const backendReviews = await apiGetReviewsByMovieId(selectedMovie!.id);
         if (isSubscribed && Array.isArray(backendReviews)) {
           const mappedReviews: Review[] = backendReviews.map((r) => ({
             id: r.id,
             movieId: r.movieId,
-            movieTitle: r.movieTitle || selectedMovie.title,
+            movieTitle: r.movieTitle || selectedMovie!.title,
             userId: r.userId,
             username: r.username || 'Anonim',
             userAvatar: r.userAvatar || 'https://images.unsplash.com/photo-1535713875002-d1d0cf377fde?w=100&auto=format&fit=crop&q=80',
@@ -982,7 +1676,7 @@ export default function App() {
             dislikes: r.dislikes || 0,
             date: r.createdAt ? new Date(r.createdAt).toLocaleDateString() : 'İndi'
           }));
-          setSelectedMovie((prev) => prev && prev.id === selectedMovie.id ? { ...prev, reviews: mappedReviews } : prev);
+          setSelectedMovie((prev) => prev && prev.id === selectedMovie!.id ? { ...prev, reviews: mappedReviews } : prev);
         }
       } catch (err) {
         console.warn('Backend reviews fetch fallback:', err);
@@ -998,37 +1692,91 @@ export default function App() {
     async function loadActiveRooms() {
       try {
         const rooms = await apiGetActiveRooms();
-        if (isSubscribed && Array.isArray(rooms) && rooms.length > 0) {
-          const backendParties: WatchParty[] = rooms.map((r) => {
-            const movieObj = movies.find(m => m.id === r.movieId) || movies[0];
+        if (!isSubscribed || !Array.isArray(rooms)) return;
+
+        const backendParties: WatchParty[] = await Promise.all(
+          rooms.map(async (r: any) => {
+            const normalizedMovieId = r.movieId ? normalizeEntityId(r.movieId) : '';
+            const creatorId = r.createdByUserId || '';
+            let creatorName = creatorId
+              ? (resolveLocalUsername(creatorId, users, currentUser) ?? '')
+              : '';
+
+            if (!creatorName && creatorId) {
+              try {
+                const profile = await apiGetUserProfile(creatorId);
+                creatorName = profile.userName || profile.fullName || creatorId;
+              } catch {
+                creatorName = creatorId;
+              }
+            }
+
             return {
               id: r.id,
               roomName: r.title,
-              movieId: r.movieId || (movieObj ? movieObj.id : ''),
-              creator: r.createdByUserId || 'Sistem',
+              movieId: normalizedMovieId,
+              streamUrl: r.streamUrl || r.StreamUrl || undefined,
+              movieTitle: r.movieTitle || r.MovieTitle || undefined,
+              movieDescription: r.movieDescription || r.MovieDescription || undefined,
+              moviePoster: r.moviePoster || r.MoviePoster || undefined,
+              movieVideoUrl: r.movieVideoUrl || r.MovieVideoUrl || undefined,
+              creator: creatorName || 'Sistem',
+              creatorId: creatorId || undefined,
               participants: [],
               currentTimestamp: 0,
               isPlaying: r.isLive,
-              chat: []
+              chat: [],
+              viewerCount: r.viewerCount ?? 0,
+              isPrivate: r.isPrivate ?? r.IsPrivate ?? false,
+              isPremium: r.isPremium ?? r.IsPremium ?? false,
             };
-          });
-          setWatchParties((prev) => {
-            const existingIds = new Set(prev.map(p => p.id));
-            const newOnes = backendParties.filter(p => !existingIds.has(p.id));
-            return [...newOnes, ...prev];
-          });
-        }
+          }),
+        );
+
+        setWatchParties((prev) =>
+          backendParties.map((party) => {
+            const existing = prev.find((p) => p.id === party.id);
+            if (!existing) return party;
+            return {
+              ...party,
+              movieTitle: party.movieTitle || existing.movieTitle,
+              movieDescription: party.movieDescription || existing.movieDescription,
+              moviePoster: party.moviePoster || existing.moviePoster,
+              streamUrl: party.streamUrl || existing.streamUrl,
+              movieVideoUrl: party.movieVideoUrl || existing.movieVideoUrl,
+              movieId: party.movieId || existing.movieId,
+              chat: existing.chat.length > 0 ? existing.chat : party.chat,
+            };
+          }),
+        );
       } catch (err) {
         console.warn('Backend active rooms fetch fallback:', err);
       }
     }
     loadActiveRooms();
     return () => { isSubscribed = false; };
-  }, [currentView, movies]);
+  }, [currentView, movies, users, currentUser?.id]);
 
   // Toggle Theme
   const toggleTheme = () => {
     setTheme((prev) => (prev === 'dark' ? 'light' : 'dark'));
+  };
+
+  const readToggleBoolean = (
+    res: unknown,
+    camelKey: string,
+    pascalKey: string,
+  ): boolean | null => {
+    if (!res || typeof res !== 'object') return null;
+    const record = res as Record<string, unknown>;
+    if (typeof record[camelKey] === 'boolean') return record[camelKey] as boolean;
+    if (typeof record[pascalKey] === 'boolean') return record[pascalKey] as boolean;
+    return null;
+  };
+
+  const restoreUserListsState = (userSnapshot: User) => {
+    setCurrentUser(userSnapshot);
+    setUsers((prev) => prev.map((u) => (u.id === userSnapshot.id ? userSnapshot : u)));
   };
 
   // Add Movie to Favorites
@@ -1036,29 +1784,20 @@ export default function App() {
     if (e) e.stopPropagation();
     if (!currentUser) return;
 
+    const pendingKey = `fav:${movieId}`;
+    if (movieListTogglePendingRef.current.has(pendingKey)) return;
+    movieListTogglePendingRef.current.add(pendingKey);
+
+    const normalizedMovieId = normalizeEntityId(movieId);
+    const previousUser = currentUser;
     let updatedFavorites = [...currentUser.favorites];
-    const isFav = updatedFavorites.includes(movieId);
+    const isFav = idsInclude(updatedFavorites, normalizedMovieId);
     const movie = movies.find(m => m.id === movieId);
 
     if (isFav) {
-      updatedFavorites = updatedFavorites.filter((id) => id !== movieId);
+      updatedFavorites = updatedFavorites.filter((id) => normalizeEntityId(id) !== normalizedMovieId);
     } else {
-      updatedFavorites.push(movieId);
-      // Append Social Activity
-      if (movie) {
-        const newActivity: Activity = {
-          id: 'act_' + Date.now(),
-          type: 'favorite',
-          userId: currentUser.id,
-          username: currentUser.username,
-          userAvatar: currentUser.avatar,
-          text: `"${movie.title}" filmini sevimli siyahısına əlavə etdi.`,
-          movieTitle: movie.title,
-          movieId: movie.id,
-          date: 'İndi'
-        };
-        setActivities((prev) => [newActivity, ...prev]);
-      }
+      updatedFavorites.push(normalizedMovieId);
     }
 
     const updatedUser = { ...currentUser, favorites: updatedFavorites };
@@ -1067,16 +1806,34 @@ export default function App() {
 
     try {
       const res = await apiToggleMovieFavorite(movieId);
-      if (res && typeof res.isFavorite === 'boolean') {
-        const syncedFavs = res.isFavorite
-          ? Array.from(new Set([...updatedFavorites, movieId]))
-          : updatedFavorites.filter(id => id !== movieId);
-        const syncedUser = { ...currentUser, favorites: syncedFavs };
-        setCurrentUser(syncedUser);
-        setUsers((prev) => prev.map((u) => (u.id === currentUser.id ? syncedUser : u)));
+      const backendFav = readToggleBoolean(res, 'isFavorite', 'IsFavorite');
+      if (backendFav === null) {
+        restoreUserListsState(previousUser);
+        toast.error('Sevimli statusu yenilənə bilmədi.');
+        return;
       }
-    } catch (err) {
-      console.warn('Backend toggle favorite synced locally:', err);
+
+      setCurrentUser((prev) => {
+        if (!prev) return prev;
+        const syncedFavs = backendFav
+          ? Array.from(new Set([...prev.favorites, normalizedMovieId]))
+          : prev.favorites.filter((id) => normalizeEntityId(id) !== normalizedMovieId);
+        return { ...prev, favorites: syncedFavs };
+      });
+      setUsers((prev) =>
+        prev.map((u) => {
+          if (u.id !== previousUser.id) return u;
+          const syncedFavs = backendFav
+            ? Array.from(new Set([...u.favorites, normalizedMovieId]))
+            : u.favorites.filter((id) => normalizeEntityId(id) !== normalizedMovieId);
+          return { ...u, favorites: syncedFavs };
+        }),
+      );
+    } catch (err: any) {
+      restoreUserListsState(previousUser);
+      toast.error(err?.message || 'Sevimli statusu yenilənə bilmədi.');
+    } finally {
+      movieListTogglePendingRef.current.delete(pendingKey);
     }
   };
 
@@ -1085,29 +1842,20 @@ export default function App() {
     if (e) e.stopPropagation();
     if (!currentUser) return;
 
+    const pendingKey = `watch:${movieId}`;
+    if (movieListTogglePendingRef.current.has(pendingKey)) return;
+    movieListTogglePendingRef.current.add(pendingKey);
+
+    const normalizedMovieId = normalizeEntityId(movieId);
+    const previousUser = currentUser;
     let updatedWatchlist = [...currentUser.watchlist];
-    const isWatch = updatedWatchlist.includes(movieId);
+    const isWatch = idsInclude(updatedWatchlist, normalizedMovieId);
     const movie = movies.find(m => m.id === movieId);
 
     if (isWatch) {
-      updatedWatchlist = updatedWatchlist.filter((id) => id !== movieId);
+      updatedWatchlist = updatedWatchlist.filter((id) => normalizeEntityId(id) !== normalizedMovieId);
     } else {
-      updatedWatchlist.push(movieId);
-      // Append Social Activity
-      if (movie) {
-        const newActivity: Activity = {
-          id: 'act_' + Date.now(),
-          type: 'collection',
-          userId: currentUser.id,
-          username: currentUser.username,
-          userAvatar: currentUser.avatar,
-          text: `"${movie.title}" filmini İzləmə Siyahısına əlavə etdi.`,
-          movieTitle: movie.title,
-          movieId: movie.id,
-          date: 'İndi'
-        };
-        setActivities((prev) => [newActivity, ...prev]);
-      }
+      updatedWatchlist.push(normalizedMovieId);
     }
 
     const updatedUser = { ...currentUser, watchlist: updatedWatchlist };
@@ -1116,16 +1864,34 @@ export default function App() {
 
     try {
       const res = await apiToggleMovieWatchlist(movieId);
-      if (res && typeof res.isInWatchlist === 'boolean') {
-        const syncedWatchlist = res.isInWatchlist
-          ? Array.from(new Set([...updatedWatchlist, movieId]))
-          : updatedWatchlist.filter(id => id !== movieId);
-        const syncedUser = { ...currentUser, watchlist: syncedWatchlist };
-        setCurrentUser(syncedUser);
-        setUsers((prev) => prev.map((u) => (u.id === currentUser.id ? syncedUser : u)));
+      const backendWatch = readToggleBoolean(res, 'isInWatchlist', 'IsInWatchlist');
+      if (backendWatch === null) {
+        restoreUserListsState(previousUser);
+        toast.error('İzləmə siyahısı yenilənə bilmədi.');
+        return;
       }
-    } catch (err) {
-      console.warn('Backend toggle watchlist synced locally:', err);
+
+      setCurrentUser((prev) => {
+        if (!prev) return prev;
+        const syncedWatchlist = backendWatch
+          ? Array.from(new Set([...prev.watchlist, normalizedMovieId]))
+          : prev.watchlist.filter((id) => normalizeEntityId(id) !== normalizedMovieId);
+        return { ...prev, watchlist: syncedWatchlist };
+      });
+      setUsers((prev) =>
+        prev.map((u) => {
+          if (u.id !== previousUser.id) return u;
+          const syncedWatchlist = backendWatch
+            ? Array.from(new Set([...u.watchlist, normalizedMovieId]))
+            : u.watchlist.filter((id) => normalizeEntityId(id) !== normalizedMovieId);
+          return { ...u, watchlist: syncedWatchlist };
+        }),
+      );
+    } catch (err: any) {
+      restoreUserListsState(previousUser);
+      toast.error(err?.message || 'İzləmə siyahısı yenilənə bilmədi.');
+    } finally {
+      movieListTogglePendingRef.current.delete(pendingKey);
     }
   };
 
@@ -1134,18 +1900,42 @@ export default function App() {
     if (e) e.stopPropagation();
     if (!currentUser) return;
 
+    const pendingKey = `book-fav:${bookId}`;
+    if (movieListTogglePendingRef.current.has(pendingKey)) return;
+    movieListTogglePendingRef.current.add(pendingKey);
+
+    const normalizedBookId = normalizeEntityId(bookId);
+    const previousUser = currentUser;
     const currentFavs = currentUser.favoriteBooks || [];
-    const isFav = currentFavs.includes(bookId);
-    const updatedFavs = isFav ? currentFavs.filter(id => id !== bookId) : [...currentFavs, bookId];
+    const isFav = idsInclude(currentFavs, normalizedBookId);
+    const updatedFavs = isFav
+      ? currentFavs.filter((id) => normalizeEntityId(id) !== normalizedBookId)
+      : [...currentFavs, normalizedBookId];
 
     const updatedUser = { ...currentUser, favoriteBooks: updatedFavs };
     setCurrentUser(updatedUser);
     setUsers((prev) => prev.map((u) => (u.id === currentUser.id ? updatedUser : u)));
 
     try {
-      await apiToggleBookFavorite(bookId);
-    } catch (err) {
-      console.warn('Backend toggle book favorite error:', err);
+      const res = await apiToggleBookFavorite(bookId);
+      const backendFav = readToggleBoolean(res, 'isFavorite', 'IsFavorite');
+      if (backendFav === null) {
+        restoreUserListsState(previousUser);
+        toast.error('Kitab sevimli statusu yenilənə bilmədi.');
+        return;
+      }
+      setCurrentUser((prev) => {
+        if (!prev) return prev;
+        const synced = backendFav
+          ? Array.from(new Set([...(prev.favoriteBooks || []), normalizedBookId]))
+          : (prev.favoriteBooks || []).filter((id) => normalizeEntityId(id) !== normalizedBookId);
+        return { ...prev, favoriteBooks: synced };
+      });
+    } catch (err: any) {
+      restoreUserListsState(previousUser);
+      toast.error(err?.message || 'Kitab sevimli statusu yenilənə bilmədi.');
+    } finally {
+      movieListTogglePendingRef.current.delete(pendingKey);
     }
   };
 
@@ -1154,18 +1944,42 @@ export default function App() {
     if (e) e.stopPropagation();
     if (!currentUser) return;
 
+    const pendingKey = `book-watch:${bookId}`;
+    if (movieListTogglePendingRef.current.has(pendingKey)) return;
+    movieListTogglePendingRef.current.add(pendingKey);
+
+    const normalizedBookId = normalizeEntityId(bookId);
+    const previousUser = currentUser;
     const currentWatchlist = currentUser.watchlistBooks || [];
-    const isIn = currentWatchlist.includes(bookId);
-    const updatedWatchlist = isIn ? currentWatchlist.filter(id => id !== bookId) : [...currentWatchlist, bookId];
+    const isIn = idsInclude(currentWatchlist, normalizedBookId);
+    const updatedWatchlist = isIn
+      ? currentWatchlist.filter((id) => normalizeEntityId(id) !== normalizedBookId)
+      : [...currentWatchlist, normalizedBookId];
 
     const updatedUser = { ...currentUser, watchlistBooks: updatedWatchlist };
     setCurrentUser(updatedUser);
     setUsers((prev) => prev.map((u) => (u.id === currentUser.id ? updatedUser : u)));
 
     try {
-      await apiToggleBookWatchlist(bookId);
-    } catch (err) {
-      console.warn('Backend toggle book watchlist error:', err);
+      const res = await apiToggleBookWatchlist(bookId);
+      const backendWatch = readToggleBoolean(res, 'isInWatchlist', 'IsInWatchlist');
+      if (backendWatch === null) {
+        restoreUserListsState(previousUser);
+        toast.error('Kitab oxuma siyahısı yenilənə bilmədi.');
+        return;
+      }
+      setCurrentUser((prev) => {
+        if (!prev) return prev;
+        const synced = backendWatch
+          ? Array.from(new Set([...(prev.watchlistBooks || []), normalizedBookId]))
+          : (prev.watchlistBooks || []).filter((id) => normalizeEntityId(id) !== normalizedBookId);
+        return { ...prev, watchlistBooks: synced };
+      });
+    } catch (err: any) {
+      restoreUserListsState(previousUser);
+      toast.error(err?.message || 'Kitab oxuma siyahısı yenilənə bilmədi.');
+    } finally {
+      movieListTogglePendingRef.current.delete(pendingKey);
     }
   };
 
@@ -1183,20 +1997,6 @@ export default function App() {
       updatedLikedMovies = currentLiked.filter((id) => id !== movieId);
     } else {
       updatedLikedMovies = [...currentLiked, movieId];
-      if (movie) {
-        const newActivity: Activity = {
-          id: 'act_' + Date.now(),
-          type: 'favorite',
-          userId: currentUser.id,
-          username: currentUser.username,
-          userAvatar: currentUser.avatar,
-          text: `"${movie.title}" filmini bəyəndi. 👍`,
-          movieTitle: movie.title,
-          movieId: movie.id,
-          date: 'İndi'
-        };
-        setActivities((prev) => [newActivity, ...prev]);
-      }
     }
 
     // Update movies array likes count
@@ -1237,67 +2037,65 @@ export default function App() {
   // Direct Watch Party Creation with simulated loading
   const handleDirectCreateWatchParty = async () => {
     if (isCreatingParty) return;
+    if (!currentUser) {
+      toast.error('Otaq yaratmaq üçün daxil olmalısınız.');
+      return;
+    }
+
     setIsCreatingParty(true);
 
-    const activeUser = currentUser || {
-      id: 'u_guest_' + Date.now(),
-      name: 'Qonaq İzləyici',
-      username: 'qonaq_' + Math.floor(100 + Math.random() * 900),
-      avatar: 'https://images.unsplash.com/photo-1535713875002-d1d0cf377fde?w=100&auto=format&fit=crop&q=80',
-      email: 'guest@cineverse.com',
-      role: 'user',
-      bio: 'CineVerse Dəvətlisi',
-      followersCount: 0,
-      followingCount: 0,
-      following: [],
-      followers: [],
-      favorites: [],
-      watchlist: [],
-      savedCollections: []
-    };
+    const defaultMovie = movies[0];
+    if (!defaultMovie) {
+      toast.error('Filmlər yüklənməyib.');
+      setIsCreatingParty(false);
+      return;
+    }
 
-    const defaultMovie = movies[0] || MOCK_MOVIES[0];
     const roomTitle = `Yayım Otağı #${watchParties.length + 1}`;
-    let backendRoomId = 'wp_' + Date.now();
 
     try {
       const res = await apiCreateRoom({
         roomName: roomTitle,
         type: 'Movie',
         movieId: defaultMovie.id,
+        isPrivate: false,
       });
-      if (res && res.roomId) {
-        backendRoomId = res.roomId;
-      }
-    } catch (err) {
-      console.warn('Backend create room fallback to local state:', err);
-    }
 
-    const newParty: WatchParty = {
-      id: backendRoomId,
-      roomName: roomTitle,
-      movieId: defaultMovie.id,
-      creator: activeUser.username,
-      participants: [
-        { id: activeUser.id, name: activeUser.name, avatar: activeUser.avatar }
-      ],
-      currentTimestamp: 0,
-      isPlaying: true,
-      chat: [
-        {
+      if (!res?.roomId) {
+        throw new Error('Backend otaq ID qaytarmadı.');
+      }
+
+      const newParty: WatchParty = {
+        id: res.roomId,
+        roomName: roomTitle,
+        movieId: defaultMovie.id,
+        movieTitle: defaultMovie.title,
+        movieDescription: defaultMovie.description,
+        moviePoster: defaultMovie.poster,
+        movieVideoUrl: defaultMovie.videoUrl,
+        creator: currentUser.username,
+        creatorId: currentUser.id,
+        participants: [{ id: currentUser.id, name: currentUser.name, avatar: currentUser.avatar }],
+        currentTimestamp: 0,
+        isPlaying: true,
+        isPrivate: false,
+        chat: [{
           id: 'sys_1',
           sender: 'Sistem',
           senderAvatar: '',
-          message: `${activeUser.name} tərəfindən "${defaultMovie.title}" yayım otağı yaradıldı! 🍿`,
-          timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
-        }
-      ]
-    };
+          message: `${currentUser.name} tərəfindən "${defaultMovie.title}" yayım otağı yaradıldı! 🍿`,
+          timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
+        }],
+      };
 
-    setWatchParties((prev) => [newParty, ...prev]);
-    setActiveWatchParty(newParty);
-    setCurrentView('watch-party-room');
-    setIsCreatingParty(false);
+      setWatchParties((prev) => [newParty, ...prev]);
+      setActiveWatchParty(newParty);
+      setCurrentView('watch-party-room');
+    } catch (err: any) {
+      toast.error(err?.message || 'Watch Party otağı yaradıla bilmədi.');
+    } finally {
+      setIsCreatingParty(false);
+    }
   };
 
   // Create New Watch Party
@@ -1314,11 +2112,15 @@ export default function App() {
       const customMovieId = 'm_ext_' + Date.now();
       
       let determinedTrailer = 'https://www.youtube.com/embed/s7EdQ4FqbhY';
+      let determinedVideoUrl: string | undefined;
       const extUrl = externalMovieUrl.trim();
       
       const youtubeRegExp = /^.*(youtu.be\/|v\/|u\/\w\/|embed\/|watch\?v=|\&v=)([^#\&\?]*).*/;
       const ytMatch = extUrl.match(youtubeRegExp);
-      if (ytMatch && ytMatch[2] && ytMatch[2].length === 11) {
+      if (extUrl && (/\.(mp4|webm|m3u8|mov)(\?.*)?$/i.test(extUrl) || extUrl.startsWith('/uploads/'))) {
+        determinedVideoUrl = extUrl;
+        determinedTrailer = extUrl;
+      } else if (ytMatch && ytMatch[2] && ytMatch[2].length === 11) {
         determinedTrailer = `https://www.youtube.com/embed/${ytMatch[2]}`;
       } else if (extUrl) {
         determinedTrailer = extUrl;
@@ -1338,6 +2140,7 @@ export default function App() {
         director: 'Naməlum',
         cast: [],
         trailerUrl: determinedTrailer,
+        videoUrl: determinedVideoUrl,
         externalUrl: extUrl || undefined,
         likes: 1,
         reviews: []
@@ -1350,83 +2153,108 @@ export default function App() {
 
     if (!movie) return;
 
-    let backendRoomId = 'wp_' + Date.now();
     try {
       const res = await apiCreateRoom({
         roomName: newPartyName.trim(),
         type: 'Movie',
-        movieId: finalMovieId,
+        movieId: useExternalMovie ? undefined : finalMovieId,
+        streamUrl: useExternalMovie ? externalMovieUrl.trim() : undefined,
+        isPrivate: newPartyIsPrivate,
+        isPremium: newPartyIsPremium,
       });
-      if (res && res.roomId) {
-        backendRoomId = res.roomId;
+
+      if (!res?.roomId) {
+        throw new Error('Backend otaq ID qaytarmadı.');
       }
-    } catch (err) {
-      console.warn('Backend create room fallback to local state:', err);
+
+      const newParty: WatchParty = {
+        id: res.roomId,
+        roomName: newPartyName.trim(),
+        movieId: finalMovieId,
+        streamUrl: useExternalMovie ? externalMovieUrl.trim() : undefined,
+        movieTitle: movie.title,
+        movieDescription: movie.description,
+        moviePoster: movie.poster,
+        movieVideoUrl: movie.videoUrl,
+        creator: currentUser.username,
+        creatorId: currentUser.id,
+        participants: [
+          { id: currentUser.id, name: currentUser.name, avatar: currentUser.avatar }
+        ],
+        currentTimestamp: 0,
+        isPlaying: true,
+        isPrivate: newPartyIsPrivate,
+        isPremium: newPartyIsPremium,
+        inviteToken: res.inviteToken,
+        chat: [
+          {
+            id: 'sys_1',
+            sender: 'Sistem',
+            senderAvatar: '',
+            message: `${currentUser.name} tərəfindən "${movie.title}" yayım otağı yaradıldı! 🍿`,
+            timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
+          }
+        ]
+      };
+
+      setWatchParties((prev) => [newParty, ...prev]);
+      setActiveWatchParty(newParty);
+      setCurrentView('watch-party-room');
+      syncWatchPartyUrl(newParty.id, newParty.isPrivate ? newParty.inviteToken : undefined);
+      setShowCreatePartyModal(false);
+
+      setNewPartyName('');
+      setNewPartyIsPrivate(false);
+      setNewPartyIsPremium(false);
+      setNewPartyMovieId('');
+      setUseExternalMovie(false);
+      setExternalMovieTitle('');
+      setExternalMovieUrl('');
+      setExternalMoviePoster('');
+      setTmdbSearchQuery('');
+      setTmdbSearchResults([]);
+      setSelectedTmdbMovie(null);
+    } catch (err: any) {
+      toast.error(err?.message || 'Watch Party otağı yaradıla bilmədi.');
     }
-
-    const newParty: WatchParty = {
-      id: backendRoomId,
-      roomName: newPartyName.trim(),
-      movieId: finalMovieId,
-      creator: currentUser.username,
-      participants: [
-        { id: currentUser.id, name: currentUser.name, avatar: currentUser.avatar }
-      ],
-      currentTimestamp: 0,
-      isPlaying: true,
-      chat: [
-        {
-          id: 'sys_1',
-          sender: 'Sistem',
-          senderAvatar: '',
-          message: `${currentUser.name} tərəfindən "${movie.title}" yayım otağı yaradıldı! 🍿`,
-          timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
-        }
-      ]
-    };
-
-    setWatchParties((prev) => [newParty, ...prev]);
-    setActiveWatchParty(newParty);
-    setCurrentView('watch-party-room');
-    setShowCreatePartyModal(false);
-    
-    // Reset states
-    setNewPartyName('');
-    setNewPartyMovieId('');
-    setUseExternalMovie(false);
-    setExternalMovieTitle('');
-    setExternalMovieUrl('');
-    setExternalMoviePoster('');
-    setTmdbSearchQuery('');
-    setTmdbSearchResults([]);
-    setSelectedTmdbMovie(null);
   };
 
   // Quick Watch Party Creation (e.g. from InviteModal)
-  const handleQuickCreateWatchParty = (roomName: string, movieId: string): WatchParty | null => {
+  const handleQuickCreateWatchParty = async (roomName: string, movieId: string): Promise<WatchParty | null> => {
     if (!currentUser) return null;
     const movie = movies.find((m) => m.id === movieId);
     if (!movie) return null;
 
+    let backendRoomId = '';
+    try {
+      const res = await apiCreateRoom({
+        roomName: roomName.trim(),
+        type: 'Movie',
+        movieId,
+      });
+      backendRoomId = res?.roomId || '';
+    } catch (err) {
+      console.warn('Watch Party yaradıla bilmədi:', err);
+      return null;
+    }
+
+    if (!backendRoomId) return null;
+
     const newParty: WatchParty = {
-      id: 'wp_' + Date.now(),
-      roomName: roomName,
-      movieId: movieId,
+      id: backendRoomId,
+      roomName: roomName.trim(),
+      movieId,
+      movieTitle: movie.title,
+      movieDescription: movie.description,
+      moviePoster: movie.poster,
+      movieVideoUrl: movie.videoUrl,
       creator: currentUser.username,
-      participants: [
-        { id: currentUser.id, name: currentUser.name, avatar: currentUser.avatar }
-      ],
+      creatorId: currentUser.id,
+      participants: [{ id: currentUser.id, name: currentUser.name, avatar: currentUser.avatar }],
       currentTimestamp: 0,
       isPlaying: true,
-      chat: [
-        {
-          id: 'sys_1',
-          sender: 'Sistem',
-          senderAvatar: '',
-          message: `${currentUser.name} tərəfindən "${movie.title}" yayım otağı yaradıldı! 🍿`,
-          timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
-        }
-      ]
+      chat: [],
+      viewerCount: 1,
     };
 
     setWatchParties((prev) => [newParty, ...prev]);
@@ -1443,50 +2271,46 @@ export default function App() {
     } catch (err) {
       console.warn('Backend InviteToRoom API notice/fallback:', err);
     }
-
-    const notif: Notification = {
-      id: 'notif_invite_' + Date.now(),
-      title: 'Watch Party Dəvəti 🍿',
-      description: `${currentUser.name} sizi "${roomName || 'Birlikdə Filmin İzlənməsi'}" otağına dəvət etdi!`,
-      type: 'party_invite',
-      date: 'İndi',
-      read: false,
-      actionUrl: `/watch-party?room=${roomId}`
-    };
-    setNotifications(prev => [notif, ...prev]);
   };
 
   // Join Watch Party
   const handleJoinParty = (party: WatchParty) => {
-    if (!currentUser) return;
-
-    // Check if already in participants
-    const exists = party.participants.some((p) => p.id === currentUser.id);
-    let updatedParticipants = [...party.participants];
-
-    if (!exists) {
-      updatedParticipants.push({ id: currentUser.id, name: currentUser.name, avatar: currentUser.avatar });
+    if (!currentUser) {
+      toast.error('Otağa qoşulmaq üçün daxil olmalısınız.');
+      return;
     }
-
-    const updatedParty = {
-      ...party,
-      participants: updatedParticipants,
-      chat: [
-        ...party.chat,
-        {
-          id: 'sys_join_' + Date.now(),
-          sender: 'Sistem',
-          senderAvatar: '',
-          message: `${currentUser.name} otağa qoşuldu.`,
-          timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
-        }
-      ]
-    };
-
-    setWatchParties((prev) => prev.map((p) => (p.id === party.id ? updatedParty : p)));
-    setActiveWatchParty(updatedParty);
+    if (!isBackendRoomId(party.id)) {
+      toast.error('Bu otaq etibarlı deyil. Zəhmət olmasa yeni otaq yaradın.');
+      return;
+    }
+    const latest = watchParties.find((p) => p.id === party.id) ?? party;
+    if (
+      latest.isPremium
+      && !currentUser.isPremium
+      && !isRoomHost(latest, currentUser)
+      && currentUser.role !== 'admin'
+    ) {
+      toast.error('Bu Premium otağa qoşulmaq üçün abunəlik lazımdır.');
+      setShowPremiumModal(true);
+      return;
+    }
+    setActiveWatchParty(latest);
     setCurrentView('watch-party-room');
+    syncWatchPartyUrl(latest.id, latest.isPrivate ? latest.inviteToken : undefined);
   };
+
+  // Aktiv otaq siyahısı yenilənəndə sahib adını sinxron saxla
+  useEffect(() => {
+    if (!activeWatchParty) return;
+    const refreshed = watchParties.find((p) => p.id === activeWatchParty.id);
+    if (!refreshed) return;
+    if (
+      refreshed.creator !== activeWatchParty.creator
+      || refreshed.creatorId !== activeWatchParty.creatorId
+    ) {
+      setActiveWatchParty((prev) => (prev ? { ...prev, creator: refreshed.creator, creatorId: refreshed.creatorId } : prev));
+    }
+  }, [watchParties, activeWatchParty?.id, activeWatchParty?.creator, activeWatchParty?.creatorId]);
 
   // Handle Review Submission
   const handleAddReview = async (e: React.FormEvent) => {
@@ -1522,20 +2346,6 @@ export default function App() {
 
     setMovies((prev) => prev.map((m) => (m.id === selectedMovie.id ? updatedMovie : m)));
     setSelectedMovie(updatedMovie);
-
-    // Append Social Activity
-    const newActivity: Activity = {
-      id: 'act_' + Date.now(),
-      type: 'review',
-      userId: currentUser.id,
-      username: currentUser.username,
-      userAvatar: currentUser.avatar,
-      text: `"${selectedMovie.title}" filminə rəy yazdı: "${reviewComment.slice(0, 40)}..."`,
-      movieTitle: selectedMovie.title,
-      movieId: selectedMovie.id,
-      date: 'İndi'
-    };
-    setActivities((prev) => [newActivity, ...prev]);
 
     // Gamification reward points for writing a review
     rewardPoints(20, 'Yeni film rəyi yazdığınız üçün');
@@ -1719,113 +2529,323 @@ export default function App() {
     }
   };
 
-  // Create Collection
-  const handleCreateCollection = (e: React.FormEvent) => {
+  // Create Collection (backend moviecollections API)
+  const handleCreateCollection = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!newColTitle.trim() || !currentUser) return;
 
-    const newCol: Collection = {
-      id: 'c_' + Date.now(),
-      title: newColTitle.trim(),
-      description: newColDesc.trim() || 'Yeni yaradılmış kolleksiya.',
-      cover: newColCover.trim() || 'https://images.unsplash.com/photo-1451187580459-43490279c0fa?w=600&auto=format&fit=crop&q=80',
-      userId: currentUser.id,
-      username: currentUser.username,
-      likesCount: 0,
-      movies: newColMovieIds
-    };
+    try {
+      const createdId = await apiCreateMovieCollection({
+        name: newColTitle.trim(),
+        description: newColDesc.trim() || 'Yeni yaradılmış kolleksiya.',
+        coverImageUrl: newColCover.trim() || undefined,
+        isPublic: true,
+      });
 
-    setCollections((prev) => [newCol, ...prev]);
-    setShowCreateCollectionModal(false);
-    
-    // Reset
-    setNewColTitle('');
-    setNewColDesc('');
-    setNewColCover('');
-    setNewColMovieIds([]);
+      const collectionId = String(createdId ?? '');
+      if (!collectionId) {
+        toast.error('Kolleksiya yaradıla bilmədi.');
+        return;
+      }
 
-    // Append Social Activity
-    const newActivity: Activity = {
-      id: 'act_' + Date.now(),
-      type: 'collection',
-      userId: currentUser.id,
-      username: currentUser.username,
-      userAvatar: currentUser.avatar,
-      text: `yeni kolleksiya yaratdı: "${newCol.title}"`,
-      collectionName: newCol.title,
-      date: 'İndi'
-    };
-    setActivities((prev) => [newActivity, ...prev]);
+      for (const movieId of newColMovieIds) {
+        await apiAddMovieToCollection(collectionId, movieId);
+      }
+
+      const newCol: Collection = {
+        id: collectionId,
+        title: newColTitle.trim(),
+        description: newColDesc.trim() || 'Yeni yaradılmış kolleksiya.',
+        cover: newColCover.trim() || 'https://images.unsplash.com/photo-1451187580459-43490279c0fa?w=600&auto=format&fit=crop&q=80',
+        userId: currentUser.id,
+        username: currentUser.username,
+        likesCount: 0,
+        movies: [...newColMovieIds],
+        movieCount: newColMovieIds.length,
+        isLikedByCurrentUser: false,
+      };
+
+      setCollections((prev) => [newCol, ...prev]);
+      setShowCreateCollectionModal(false);
+      setNewColTitle('');
+      setNewColDesc('');
+      setNewColCover('');
+      setNewColMovieIds([]);
+      toast.success('Kolleksiya uğurla yaradıldı.');
+    } catch (err: any) {
+      toast.error(err?.message || 'Kolleksiya yaradıla bilmədi.');
+    }
   };
 
-  // Follow/Unfollow system
-  const handleFollowUser = (userId: string) => {
-    if (!currentUser) return;
+  const handleToggleCollectionLike = async (collectionId: string) => {
+    const target = collections.find((c) => c.id === collectionId);
+    if (!target) return;
 
-    const userToFollow = users.find((u) => u.id === userId);
-    if (!userToFollow) return;
+    const previous = collections;
+    const optimisticLiked = !target.isLikedByCurrentUser;
+    setCollections((prev) =>
+      prev.map((c) =>
+        c.id === collectionId
+          ? {
+              ...c,
+              isLikedByCurrentUser: optimisticLiked,
+              likesCount: Math.max(0, c.likesCount + (optimisticLiked ? 1 : -1)),
+            }
+          : c,
+      ),
+    );
+
+    try {
+      const isLiked = await apiToggleMovieCollectionLike(collectionId);
+      setCollections((prev) =>
+        prev.map((c) =>
+          c.id === collectionId
+            ? {
+                ...c,
+                isLikedByCurrentUser: !!isLiked,
+              }
+            : c,
+        ),
+      );
+    } catch (err: any) {
+      setCollections(previous);
+      toast.error(err?.message || 'Bəyənmə yenilənmədi.');
+    }
+  };
+
+  const handleStartWatchingMovie = async (movieId: string) => {
+    setActivePlayerMode('movie');
+    rewardPoints(15, 'Film izləməyə başladığınız üçün');
+    setTimeout(() => {
+      document.getElementById('cinetheater-player')?.scrollIntoView({ behavior: 'smooth', block: 'center' });
+    }, 100);
+
+    try {
+      await apiMarkMovieAsWatched(movieId);
+      await loadMovieWatchHistory();
+    } catch (err) {
+      console.warn('Film izləmə tarixi backend-ə yazıla bilmədi:', err);
+    }
+  };
+
+  const runFriendAction = async (key: string, action: () => Promise<unknown>, refresh = true) => {
+    if (friendActionPending.has(key)) return;
+    setFriendActionPending((prev) => new Set(prev).add(key));
+    try {
+      await action();
+      if (refresh && currentUser?.id) {
+        const [friendsRes, pendingRes, followingRes] = await Promise.all([
+          apiGetFriends(currentUser.id),
+          apiGetPendingFriendRequests(),
+          apiGetFollowing(currentUser.id),
+        ]);
+        const friendsList = Array.isArray(friendsRes) ? friendsRes : [];
+        const followingList = Array.isArray(followingRes) ? followingRes : [];
+        setFriends(friendsList);
+        setPendingFriendRequests(Array.isArray(pendingRes) ? pendingRes : []);
+        setInviteDirectory(buildInviteDirectory(friendsList, followingList, currentUser.id));
+      }
+    } finally {
+      setFriendActionPending((prev) => {
+        const next = new Set(prev);
+        next.delete(key);
+        return next;
+      });
+    }
+  };
+
+  const handleSendFriendRequest = async (userId: string) => {
+    if (!currentUser || userId === currentUser.id) return;
+    try {
+      await runFriendAction(`req:${userId}`, () => apiSendFriendRequest(userId), false);
+      toast.success('Dostluq sorğusu göndərildi.');
+    } catch (err: any) {
+      toast.error(err?.message || 'Dostluq sorğusu göndərilmədi.');
+    }
+  };
+
+  const handleAcceptFriendRequest = async (friendshipId: string) => {
+    try {
+      await runFriendAction(`accept:${friendshipId}`, () => apiAcceptFriendRequest(friendshipId));
+      toast.success('Dostluq sorğusu qəbul edildi.');
+    } catch (err: any) {
+      toast.error(err?.message || 'Sorğu qəbul edilmədi.');
+    }
+  };
+
+  const handleDeclineFriendRequest = async (friendshipId: string) => {
+    try {
+      await runFriendAction(`decline:${friendshipId}`, () => apiDeclineFriendRequest(friendshipId));
+      toast.success('Dostluq sorğusu rədd edildi.');
+    } catch (err: any) {
+      toast.error(err?.message || 'Sorğu rədd edilmədi.');
+    }
+  };
+
+  const handleRemoveFriend = async (userId: string) => {
+    if (!window.confirm('Bu istifadəçini dost siyahısından silmək istəyirsiniz?')) return;
+    try {
+      await runFriendAction(`remove:${userId}`, () => apiRemoveFriend(userId));
+      setInviteDirectory((prev) => prev.filter((u) => u.id !== userId));
+      toast.success('Dost siyahıdan silindi.');
+    } catch (err: any) {
+      toast.error(err?.message || 'Dost silinmədi.');
+    }
+  };
+
+  // Follow/Unfollow system — backend SocialController ilə sinxron
+  const handleFollowUser = async (userId: string) => {
+    if (!currentUser) return;
+    if (userId === currentUser.id) return;
+    if (followPendingRef.current.has(userId)) return;
 
     const isFollowing = currentUser.following.includes(userId);
-    let updatedFollowing = [...currentUser.following];
-    let targetFollowers = [...userToFollow.followers];
+    const previousUser = currentUser;
+    const previousUsers = users;
+    const previousSelectedProfile = selectedProfileUser;
+    const previousSocialModalUser = socialModalUser;
+    const previousModalFollowersCount = socialModalFollowersCount;
+    const previousModalFollowingCount = socialModalFollowingCount;
 
-    if (isFollowing) {
-      updatedFollowing = updatedFollowing.filter((id) => id !== userId);
-      targetFollowers = targetFollowers.filter((id) => id !== currentUser.id);
-    } else {
-      updatedFollowing.push(userId);
-      targetFollowers.push(currentUser.id);
+    const updatedFollowing = isFollowing
+      ? currentUser.following.filter((id) => id !== userId)
+      : [...currentUser.following, userId];
 
-      // Append notification to target user
-      const newNotif: Notification = {
-        id: 'n_follow_' + Date.now(),
-        type: 'follower',
-        title: 'Yeni İzləyici',
-        description: `@${currentUser.username} sizi izləməyə başladı.`,
-        date: 'İndi',
-        read: false
-      };
-      setNotifications((prev) => [newNotif, ...prev]);
-    }
-
-    const updatedMe = {
+    const updatedMe: User = {
       ...currentUser,
       following: updatedFollowing,
-      followingCount: updatedFollowing.length
+      followingCount: updatedFollowing.length,
     };
 
-    const updatedTarget = {
-      ...userToFollow,
-      followers: targetFollowers,
-      followersCount: targetFollowers.length
-    };
-
+    followPendingRef.current.add(userId);
     setCurrentUser(updatedMe);
+
     setUsers((prev) =>
       prev.map((u) => {
         if (u.id === currentUser.id) return updatedMe;
-        if (u.id === userId) return updatedTarget;
+        if (u.id === userId) {
+          const targetFollowers = isFollowing
+            ? u.followers.filter((id) => id !== currentUser.id)
+            : [...u.followers, currentUser.id];
+          return {
+            ...u,
+            followers: targetFollowers,
+            followersCount: targetFollowers.length,
+          };
+        }
         return u;
       })
     );
 
-    if (selectedProfileUser && selectedProfileUser.id === userId) {
-      setSelectedProfileUser(updatedTarget);
+    if (selectedProfileUser?.id === userId) {
+      setSelectedProfileUser((prev) => {
+        if (!prev) return prev;
+        const targetFollowers = isFollowing
+          ? (prev.followers || []).filter((id) => id !== currentUser.id)
+          : [...(prev.followers || []), currentUser.id];
+        return {
+          ...prev,
+          followers: targetFollowers,
+          followersCount: targetFollowers.length,
+        };
+      });
+    }
+
+    if (socialModalUser?.id === currentUser.id) {
+      setSocialModalFollowingCount(updatedFollowing.length);
+    }
+    if (socialModalUser?.id === userId) {
+      setSocialModalUser((prev) => {
+        if (!prev) return prev;
+        const targetFollowers = isFollowing
+          ? (prev.followers || []).filter((id) => id !== currentUser.id)
+          : [...(prev.followers || []), currentUser.id];
+        return {
+          ...prev,
+          followers: targetFollowers,
+          followersCount: targetFollowers.length,
+        };
+      });
+      setSocialModalFollowersCount((prev) => (isFollowing ? Math.max(0, prev - 1) : prev + 1));
+    }
+    socialListsCacheRef.current = null;
+
+    try {
+      if (isFollowing) {
+        await apiUnfollowUser(userId);
+      } else {
+        await apiFollowUser(userId);
+      }
+    } catch (err) {
+      console.warn('Follow/unfollow backend xətası, lokal state geri qaytarılır:', err);
+      setCurrentUser(previousUser);
+      setUsers(previousUsers);
+      setSelectedProfileUser(previousSelectedProfile);
+      setSocialModalUser(previousSocialModalUser);
+      setSocialModalFollowersCount(previousModalFollowersCount);
+      setSocialModalFollowingCount(previousModalFollowingCount);
+    } finally {
+      followPendingRef.current.delete(userId);
     }
   };
 
   // User Profile Navigation helpers
-  const navigateToUserProfileById = (userId: string) => {
+  const navigateToUserProfileById = async (userId: string) => {
     if (!currentUser) return;
     if (userId === currentUser.id) {
       setSelectedProfileUser(null);
-    } else {
-      const foundUser = users.find(u => u.id === userId);
+      setCurrentView('profile');
+      return;
+    }
+
+    setCurrentView('profile');
+
+    try {
+      const [profile, followersRes, followingRes] = await Promise.all([
+        apiGetUserProfile(userId),
+        apiGetFollowers(userId),
+        apiGetFollowing(userId),
+      ]);
+      const followersList = Array.isArray(followersRes) ? followersRes : [];
+      const followingList = Array.isArray(followingRes) ? followingRes : [];
+      const followersIds = followersList.map((u) => u.id).filter(Boolean);
+      const followingIds = followingList.map((u) => u.id).filter(Boolean);
+
+      const mappedUser: User = {
+        id: profile.id,
+        username: profile.userName,
+        name: profile.fullName,
+        email: '',
+        avatar: profile.avatar || 'https://images.unsplash.com/photo-1535713875002-d1d0cf377fde?w=150&auto=format&fit=crop&q=80',
+        bio: profile.bio ?? '',
+        followersCount: followersIds.length,
+        followingCount: followingIds.length,
+        role: 'user',
+        favorites: [],
+        watchlist: [],
+        savedCollections: [],
+        followers: followersIds,
+        following: followingIds,
+        points: profile.points,
+        badge: getHighestBadgeForPoints(profile.points ?? 0).name,
+        isPremium: profile.isPremium,
+      };
+
+      setSelectedProfileUser(mappedUser);
+      setUsers((prev) => {
+        const exists = prev.some((u) => u.id === userId);
+        if (exists) {
+          return prev.map((u) => (u.id === userId ? { ...u, ...mappedUser } : u));
+        }
+        return [...prev, mappedUser];
+      });
+    } catch (err) {
+      console.warn('Profil backend-dən yüklənmədi, lokal fallback istifadə olunur:', err);
+      const foundUser = users.find((u) => u.id === userId);
       if (foundUser) {
         setSelectedProfileUser(foundUser);
       }
     }
-    setCurrentView('profile');
   };
 
   const navigateToUserProfileByUsername = (username: string) => {
@@ -1842,36 +2862,8 @@ export default function App() {
     setCurrentView('profile');
   };
 
-  // Filter movies for Movies Grid page
-  const filteredMoviesList = movies.filter((m) => {
-    const matchesSearch = 
-      m.title.toLowerCase().includes(movieSearch.toLowerCase()) ||
-      m.originalTitle.toLowerCase().includes(movieSearch.toLowerCase()) ||
-      m.director.toLowerCase().includes(movieSearch.toLowerCase());
-    
-    const matchesGenre = selectedGenre === 'Hamsı' || m.genres.includes(selectedGenre);
-    
-    let matchesYear = true;
-    if (selectedYear !== 'Hamsı') {
-      if (selectedYear === '2020+') matchesYear = m.year >= 2020;
-      else if (selectedYear === '2010s') matchesYear = m.year >= 2010 && m.year < 2020;
-      else if (selectedYear === '2000s') matchesYear = m.year >= 2000 && m.year < 2010;
-      else if (selectedYear === 'Köhnə') matchesYear = m.year < 2000;
-    }
-
-    let matchesRating = true;
-    if (selectedRating !== 'Hamsı') {
-      const minRat = Number(selectedRating);
-      matchesRating = m.rating >= minRat;
-    }
-
-    return matchesSearch && matchesGenre && matchesYear && matchesRating;
-  }).sort((a, b) => {
-    if (selectedSort === 'rating-desc') return b.rating - a.rating;
-    if (selectedSort === 'year-desc') return b.year - a.year;
-    if (selectedSort === 'likes-desc') return b.likes - a.likes;
-    return 0;
-  });
+  // Filter movies for Movies Grid page — server-side results
+  const filteredMoviesList = moviesListResults;
 
   // Global search filtering for instant results popup / query focus
   const searchResults = movies.filter((m) =>
@@ -1887,6 +2879,14 @@ export default function App() {
       {/* 1. Auth Page Guard */}
       <AnimatePresence mode="wait">
         {!currentUser ? (
+        parseWatchPartyRoute().partyId ? (
+          <WatchPartyGuestPreview
+            preview={guestPartyPreview}
+            isLoading={guestPartyPreviewLoading}
+            inviteToken={pendingPartyRouteRef.current.inviteToken}
+            onLoginSuccess={handleLoginSuccess}
+          />
+        ) : (
           <motion.div
             key="auth-guard"
             initial={{ opacity: 0, y: 15 }}
@@ -1897,7 +2897,8 @@ export default function App() {
           >
             <LoginRegister onLoginSuccess={handleLoginSuccess} />
           </motion.div>
-        ) : (
+        )
+      ) : (
           <motion.div
             key="app-shell"
             initial={{ opacity: 0, y: 15 }}
@@ -1918,6 +2919,8 @@ export default function App() {
               setIsAdminMode={setIsAdminMode}
               notifications={notifications}
               setNotifications={setNotifications}
+              realtimeUnreadCount={realtimeUnreadCount}
+              setRealtimeUnreadCount={setRealtimeUnreadCount}
               searchQuery={searchQuery}
               setSearchQuery={setSearchQuery}
               theme={theme}
@@ -2263,7 +3266,7 @@ export default function App() {
                         <button
                           onClick={() => toggleWatchlist(movies[0].id)}
                           className={`p-2.5 rounded-xl border transition cursor-pointer ${
-                            currentUser.watchlist.includes(movies[0].id)
+                            idsInclude(currentUser.watchlist, movies[0].id)
                               ? 'bg-red-600/20 border-red-500 text-red-500'
                               : 'bg-black/35 border-zinc-800 text-white hover:bg-black/55'
                           }`}
@@ -2307,7 +3310,24 @@ export default function App() {
                         </div>
                         
                         <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
-                          {getAIRecommendations().map(({ movie, reason }, index) => (
+                          {homeRecommendationsLoading ? (
+                            Array.from({ length: 4 }).map((_, index) => (
+                              <div
+                                key={`rec_loading_${index}`}
+                                className={`p-2.5 rounded-2xl border animate-pulse ${
+                                  theme === 'dark' ? 'bg-zinc-900/40 border-white/5' : 'bg-zinc-50 border-zinc-150'
+                                }`}
+                              >
+                                <div className="aspect-[2/3] rounded-xl bg-zinc-800/60" />
+                                <div className="mt-2.5 h-3 bg-zinc-800/60 rounded" />
+                              </div>
+                            ))
+                          ) : homeRecommendations.length === 0 ? (
+                            <p className={`col-span-full text-xs ${theme === 'dark' ? 'text-zinc-500' : 'text-zinc-600'}`}>
+                              Hazırda tövsiyə tapılmadı.
+                            </p>
+                          ) : (
+                          homeRecommendations.map(({ movie, reason }, index) => (
                             <motion.div
                               key={`rec_${movie.id}`}
                               onClick={() => { setSelectedMovie(movie); setCurrentView('movie-details'); }}
@@ -2321,7 +3341,7 @@ export default function App() {
                               <div className="relative aspect-[2/3] rounded-xl overflow-hidden border border-zinc-850/10 shadow-lg">
                                 <img src={movie.poster} alt={movie.title} className="w-full h-full object-cover group-hover:scale-105 transition duration-500" />
                                 <div className="absolute top-2 right-2 bg-black/80 backdrop-blur-xs px-2 py-0.5 rounded text-[10px] font-bold text-amber-500 flex items-center gap-0.5">
-                                  ★ {movie.rating}
+                                  ★ {Number(movie.rating).toFixed(1)}
                                 </div>
                                 <div className="absolute inset-x-0 bottom-0 bg-black/85 backdrop-blur-xs p-1.5 text-center text-[9px] font-bold text-red-400 line-clamp-2">
                                   {reason}
@@ -2337,7 +3357,8 @@ export default function App() {
                                 </div>
                               </div>
                             </motion.div>
-                          ))}
+                          ))
+                          )}
                         </div>
                       </div>
                       
@@ -2361,7 +3382,8 @@ export default function App() {
                               <div className="relative aspect-[2/3] rounded-2xl overflow-hidden border border-zinc-800/10 shadow-lg">
                                 <LazyImage src={movie.poster} alt={movie.title} className="w-full h-full object-cover group-hover:scale-105 transition-transform duration-200 ease-[cubic-bezier(0.16,1,0.3,1)]" />
                                 <div className="absolute top-2 right-2 bg-black/75 backdrop-blur-xs px-2 py-0.5 rounded text-[10px] font-bold text-amber-500 flex items-center gap-0.5 z-20">
-                                  ★ {movie.rating}
+                                  ★ {Number(movie.rating).toFixed(1)}
+
                                 </div>
                                 {/* Poster Gradient Overlay */}
                                 <div className="absolute inset-0 bg-gradient-to-t from-black/95 via-black/40 to-transparent opacity-0 group-hover:opacity-100 transition-opacity duration-200 ease-[cubic-bezier(0.16,1,0.3,1)] flex flex-col justify-end p-3 pointer-events-none z-10">
@@ -2399,7 +3421,7 @@ export default function App() {
                               <div className="relative aspect-[2/3] rounded-2xl overflow-hidden border border-zinc-800/10 shadow-lg">
                                 <LazyImage src={movie.poster} alt={movie.title} className="w-full h-full object-cover group-hover:scale-105 transition-transform duration-200 ease-[cubic-bezier(0.16,1,0.3,1)]" />
                                 <div className="absolute top-2 right-2 bg-black/75 backdrop-blur-xs px-2 py-0.5 rounded text-[10px] font-bold text-amber-500 flex items-center gap-0.5 z-20">
-                                  ★ {movie.rating}
+                                  ★ {Number(movie.rating).toFixed(1)}
                                 </div>
                                 {/* Poster Gradient Overlay */}
                                 <div className="absolute inset-0 bg-gradient-to-t from-black/95 via-black/40 to-transparent opacity-0 group-hover:opacity-100 transition-opacity duration-200 ease-[cubic-bezier(0.16,1,0.3,1)] flex flex-col justify-end p-3 pointer-events-none z-10">
@@ -2452,7 +3474,13 @@ export default function App() {
                               
                               <div className="flex items-center justify-between mt-3.5 pt-2 border-t border-zinc-800/10 text-[10px] text-zinc-500">
                                 <span>@{col.username} tərəfindən</span>
-                                <button className="flex items-center gap-1 text-red-500 font-semibold hover:scale-105 transition">
+                                <button
+                                  type="button"
+                                  onClick={() => handleToggleCollectionLike(col.id)}
+                                  className={`flex items-center gap-1 font-semibold hover:scale-105 transition ${
+                                    col.isLikedByCurrentUser ? 'text-red-500' : 'text-zinc-500'
+                                  }`}
+                                >
                                   ❤ {col.likesCount} Bəyəni
                                 </button>
                               </div>
@@ -2496,7 +3524,7 @@ export default function App() {
                                 }`}>{act.text}</p>
                                 <span className={`text-[9px] font-mono block ${
                                   theme === 'dark' ? 'text-zinc-500' : 'text-zinc-500 font-semibold'
-                                }`}>{act.date}</span>
+                                }`}>{act.date ?? act.createdAt}</span>
                               </div>
                             </div>
                           ))}
@@ -2652,7 +3680,7 @@ export default function App() {
                       <span>Tapılan Filmlər: <strong className="font-bold">{filteredMoviesList.length} ədəd</strong></span>
                     </div>
 
-                    {isViewLoading || isMoviesFilterLoading ? (
+                    {isViewLoading || isMoviesListLoading ? (
                       <MovieGridSkeleton count={12} />
                     ) : filteredMoviesList.length === 0 ? (
                       <EmptyState
@@ -2685,7 +3713,7 @@ export default function App() {
                             <div className="relative aspect-[2/3] rounded-3xl overflow-hidden border border-zinc-800/10 shadow-lg">
                               <LazyImage src={movie.poster} alt={movie.title} className="w-full h-full object-cover group-hover:scale-105 transition-transform duration-200 ease-[cubic-bezier(0.16,1,0.3,1)]" />
                               <div className="absolute top-3 right-3 bg-black/75 backdrop-blur-xs px-2.5 py-0.5 rounded-xl text-[10px] font-bold text-amber-500 flex items-center gap-0.5 shadow-md z-20">
-                                ★ {movie.rating}
+                                ★ {Number(movie.rating).toFixed(1)}
                               </div>
 
                               {/* Hover details box with gradient overlay */}
@@ -2707,7 +3735,7 @@ export default function App() {
                                     onClick={(e) => toggleFavorite(movie.id, e)}
                                     title="Sevimlilərə Əlavə Et"
                                     className={`p-1.5 rounded-lg border transition ${
-                                      currentUser?.favorites.includes(movie.id) ? 'bg-red-600/20 border-red-500 text-red-500' : 'bg-zinc-900 border-zinc-800 text-white'
+                                      idsInclude(currentUser?.favorites, movie.id) ? 'bg-red-600/20 border-red-500 text-red-500' : 'bg-zinc-900 border-zinc-800 text-white'
                                     }`}
                                   >
                                     <Heart className="w-3.5 h-3.5 fill-transparent" />
@@ -2716,7 +3744,7 @@ export default function App() {
                                     onClick={(e) => toggleWatchlist(movie.id, e)}
                                     title="İzləmə Siyahısına Əlavə Et"
                                     className={`p-1.5 rounded-lg border transition ${
-                                      currentUser?.watchlist.includes(movie.id) ? 'bg-red-600/20 border-red-500 text-red-500' : 'bg-zinc-900 border-zinc-800 text-white'
+                                      idsInclude(currentUser?.watchlist, movie.id) ? 'bg-red-600/20 border-red-500 text-red-500' : 'bg-zinc-900 border-zinc-800 text-white'
                                     }`}
                                   >
                                     <Bookmark className="w-3.5 h-3.5" />
@@ -2730,6 +3758,17 @@ export default function App() {
                             </div>
                           </motion.div>
                         ))}
+                      </div>
+                    )}
+                    {moviesListHasMore && !isMoviesListLoading && filteredMoviesList.length > 0 && (
+                      <div className="flex justify-center pt-4">
+                        <button
+                          type="button"
+                          onClick={handleLoadMoreMovies}
+                          className="px-6 py-2.5 bg-red-600 hover:bg-red-500 text-white text-xs font-bold rounded-xl transition cursor-pointer"
+                        >
+                          Daha çox film yüklə
+                        </button>
                       </div>
                     )}
                   </div>
@@ -2796,7 +3835,7 @@ export default function App() {
                       />
                     ) : (
                       <div className="grid grid-cols-2 sm:grid-cols-4 lg:grid-cols-5 xl:grid-cols-6 gap-6">
-                        {movies.filter((m) => currentUser?.favorites?.includes(m.id)).map((movie, index) => (
+                        {movies.filter((m) => idsInclude(currentUser?.favorites, m.id)).map((movie, index) => (
                           <motion.div
                             key={movie.id}
                             initial={{ opacity: 0, y: 30 }}
@@ -2836,7 +3875,7 @@ export default function App() {
                       />
                     ) : (
                       <div className="grid grid-cols-2 sm:grid-cols-4 lg:grid-cols-5 xl:grid-cols-6 gap-6">
-                        {books.filter((b) => currentUser?.favoriteBooks?.includes(b.id)).map((book, index) => (
+                        {books.filter((b) => idsInclude(currentUser?.favoriteBooks, b.id)).map((book, index) => (
                           <motion.div
                             key={book.id}
                             initial={{ opacity: 0, y: 30 }}
@@ -2927,7 +3966,7 @@ export default function App() {
                       />
                     ) : (
                       <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
-                        {movies.filter((m) => currentUser?.watchlist?.includes(m.id)).map((movie, index) => (
+                        {movies.filter((m) => idsInclude(currentUser?.watchlist, m.id)).map((movie, index) => (
                           <motion.div
                             key={movie.id}
                             initial={{ opacity: 0, y: 30 }}
@@ -2992,7 +4031,7 @@ export default function App() {
                       />
                     ) : (
                       <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
-                        {books.filter((b) => currentUser?.watchlistBooks?.includes(b.id)).map((book, index) => {
+                        {books.filter((b) => idsInclude(currentUser?.watchlistBooks, b.id)).map((book, index) => {
                           const progress = currentUser?.readingProgress?.[book.id] || 0;
                           return (
                             <motion.div
@@ -3051,6 +4090,86 @@ export default function App() {
                 </motion.div>
               )}
 
+              {/* D2. MOVIE WATCH HISTORY VIEW */}
+              {currentView === 'watch-history' && (
+                <motion.div
+                  key="watch-history"
+                  initial={{ opacity: 0, y: 15 }}
+                  animate={{ opacity: 1, y: 0 }}
+                  exit={{ opacity: 0, y: -15 }}
+                  transition={{ duration: 0.35, ease: "easeOut" }}
+                  className="space-y-6"
+                >
+                  <div>
+                    <h1 className="text-2xl font-bold tracking-tight">İzləmə Tarixi</h1>
+                    <p className="text-sm text-zinc-500 mt-1">Son izlədiyiniz filmlər (backend tarixinə əsasən).</p>
+                  </div>
+
+                  {isMovieWatchHistoryLoading ? (
+                    <MovieGridSkeleton count={6} />
+                  ) : movieWatchHistoryError ? (
+                    <div className="bg-red-500/10 border border-red-500/20 text-red-400 px-4 py-3 rounded-xl text-xs font-semibold">
+                      {movieWatchHistoryError}
+                    </div>
+                  ) : movieWatchHistory.length === 0 ? (
+                    <EmptyState
+                      icon={Clock}
+                      title="İzləmə Tarixi Boşdur"
+                      description="Hələ heç bir film izləməyə başlamamısınız. Film səhifəsində 'İzləməyə Başla' düyməsinə basaraq tarixinizi yarada bilərsiniz."
+                      actionLabel="Filmləri Kəşf Et"
+                      actionIcon={Film}
+                      onAction={() => setCurrentView('movies')}
+                      theme={theme}
+                    />
+                  ) : (
+                    <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
+                      {movieWatchHistory.map((movie, index) => (
+                        <motion.div
+                          key={movie.id}
+                          initial={{ opacity: 0, y: 30 }}
+                          whileInView={{ opacity: 1, y: 0 }}
+                          viewport={{ once: true, amount: 0.1 }}
+                          transition={{ duration: 0.4, delay: (index % 8) * 0.07, ease: [0.16, 1, 0.3, 1] }}
+                          className={`p-4 rounded-3xl border flex gap-4 transition hover:border-red-500/20 ${
+                            theme === 'dark' ? 'bg-zinc-900/40 border-zinc-850' : 'bg-white border-zinc-200'
+                          }`}
+                        >
+                          <div
+                            className="w-20 h-28 flex-shrink-0 rounded-2xl overflow-hidden cursor-pointer"
+                            onClick={() => { setSelectedMovie(movie); setCurrentView('movie-details'); }}
+                          >
+                            <LazyImage
+                              src={movie.poster}
+                              alt={movie.title}
+                              className="w-full h-full object-cover"
+                            />
+                          </div>
+                          <div className="flex-1 flex flex-col justify-between">
+                            <div>
+                              <h3
+                                className="font-bold text-xs hover:text-red-500 transition cursor-pointer"
+                                onClick={() => { setSelectedMovie(movie); setCurrentView('movie-details'); }}
+                              >
+                                {movie.title}
+                              </h3>
+                              <p className="text-[10px] text-zinc-500 mt-0.5">{movie.year} • ★ {movie.rating}</p>
+                              {movie.duration && (
+                                <p className="text-[10px] text-zinc-400 mt-1">{movie.duration}</p>
+                              )}
+                              <p className="text-[10px] text-zinc-400 line-clamp-2 mt-1 leading-normal">{movie.description}</p>
+                            </div>
+                            <div className="flex items-center gap-1.5 text-[9px] text-zinc-500 mt-2">
+                              <Clock className="w-3 h-3 text-red-500" />
+                              <span>İzlənilib</span>
+                            </div>
+                          </div>
+                        </motion.div>
+                      ))}
+                    </div>
+                  )}
+                </motion.div>
+              )}
+
               {/* E. WATCH PARTY VIEW */}
               {currentView === 'watch-party' && (
                 <motion.div
@@ -3065,6 +4184,11 @@ export default function App() {
                     <div>
                       <h1 className="text-2xl font-bold tracking-tight">Sosial Yayım (Watch Party)</h1>
                       <p className="text-sm text-zinc-500 mt-1">Dostlarınızla eyni anda filmləri izləyin, rəy bildirin və real-time ünsiyyət qurun.</p>
+                      {!currentUser && (
+                        <p className="text-xs text-amber-500/90 mt-2">
+                          Açıq otaqları görə bilərsiniz. Qoşulmaq və otaq yaratmaq üçün daxil olun.
+                        </p>
+                      )}
                     </div>
                     <div className="relative group self-start md:self-auto">
                       {isCreatingParty && (
@@ -3153,7 +4277,7 @@ export default function App() {
                   ) : (
                     <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
                     {watchParties.map((party, index) => {
-                      const movieObj = movies.find((m) => m.id === party.movieId) || movies[0];
+                      const movieObj = resolvePartyMovie(party, movies);
                       return (
                         <motion.div
                           key={party.id}
@@ -3184,6 +4308,20 @@ export default function App() {
                             <div className="flex-1 space-y-1">
                               <div className="flex items-center gap-2">
                                 <h3 className="font-extrabold text-sm">{party.roomName}</h3>
+                                {party.isPrivate ? (
+                                  <span className="inline-flex items-center gap-1 px-2 py-0.5 bg-zinc-800 text-zinc-300 text-[9px] font-bold rounded-full">
+                                    <Lock className="w-3 h-3" /> Məxfi
+                                  </span>
+                                ) : (
+                                  <span className="inline-flex items-center gap-1 px-2 py-0.5 bg-emerald-600/15 text-emerald-400 text-[9px] font-bold rounded-full">
+                                    <Globe className="w-3 h-3" /> Açıq
+                                  </span>
+                                )}
+                                {party.isPremium && (
+                                  <span className="inline-flex items-center gap-1 px-2 py-0.5 bg-amber-500/15 text-amber-400 text-[9px] font-bold rounded-full">
+                                    <Sparkles className="w-3 h-3" /> Premium
+                                  </span>
+                                )}
                                 {party.isPlaying && (
                                   <span className="px-2 py-0.5 bg-red-600 text-white text-[9px] font-bold rounded-full animate-pulse">AKTİV YAYIM</span>
                                 )}
@@ -3200,10 +4338,10 @@ export default function App() {
                           <div className="flex items-center justify-between border-t border-zinc-800/10 pt-4 relative z-10 text-xs">
                             <div className="flex items-center gap-1.5 text-zinc-500">
                               <Users className="w-4 h-4 text-red-500" />
-                              <span>{party.participants.length} İştirakçı</span>
+                              <span>{Math.max(party.viewerCount ?? 0, party.participants.length)} İştirakçı</span>
                             </div>
                             <div className="flex gap-2">
-                              {currentUser && (party.creator === currentUser.username || currentUser.role === 'admin') && (
+                              {currentUser && (isRoomHost(party, currentUser) || currentUser.role === 'admin') && (
                                 <button
                                   onClick={() => handleDeleteWatchParty(party.id)}
                                   className="py-1.5 px-3 bg-zinc-800 hover:bg-red-950 hover:text-red-400 text-zinc-400 text-xs font-semibold rounded-xl transition cursor-pointer flex items-center gap-1"
@@ -3212,6 +4350,17 @@ export default function App() {
                                   <Trash2 className="w-3.5 h-3.5" /> Sil
                                 </button>
                               )}
+                              <button
+                                onClick={() => {
+                                  const url = getWatchPartyUrl(party.id, party.isPrivate ? party.inviteToken : undefined);
+                                  navigator.clipboard.writeText(url);
+                                  toast.success('Otaq linki kopyalandı!');
+                                }}
+                                className="py-1.5 px-3 bg-zinc-800 hover:bg-zinc-700 text-zinc-200 text-xs font-semibold rounded-xl transition cursor-pointer flex items-center gap-1"
+                                title="Otaq linkini kopyala"
+                              >
+                                <Share2 className="w-3.5 h-3.5" /> Link
+                              </button>
                               <button
                                 onClick={() => {
                                   setInviteModalMovie(movieObj);
@@ -3224,9 +4373,23 @@ export default function App() {
                               </button>
                               <button
                                 onClick={() => handleJoinParty(party)}
-                                className="py-1.5 px-4 bg-red-600 hover:bg-red-500 text-white text-xs font-semibold rounded-xl transition cursor-pointer"
+                                className={`py-1.5 px-4 text-white text-xs font-semibold rounded-xl transition cursor-pointer ${
+                                  party.isPremium
+                                    && currentUser
+                                    && !currentUser.isPremium
+                                    && !isRoomHost(party, currentUser)
+                                    && currentUser.role !== 'admin'
+                                    ? 'bg-amber-600 hover:bg-amber-500'
+                                    : 'bg-red-600 hover:bg-red-500'
+                                }`}
                               >
-                                Otağa Qoşul
+                                {party.isPremium
+                                  && currentUser
+                                  && !currentUser.isPremium
+                                  && !isRoomHost(party, currentUser)
+                                  && currentUser.role !== 'admin'
+                                  ? 'Premium ilə Qoşul'
+                                  : 'Otağa Qoşul'}
                               </button>
                             </div>
                           </div>
@@ -3250,7 +4413,12 @@ export default function App() {
                   <WatchPartyRoom 
                   party={activeWatchParty}
                   currentUser={currentUser}
-                  onLeave={() => { setActiveWatchParty(null); setCurrentView('watch-party'); }}
+                  onLeave={() => {
+                    setActiveWatchParty(null);
+                    setCurrentView('watch-party');
+                    clearWatchPartyUrl();
+                    hasAutoJoined.current = false;
+                  }}
                   onCloseRoom={handleCloseWatchParty}
                   onDeleteRoom={handleDeleteWatchParty}
                   onUpdateParty={(updated) => {
@@ -3259,10 +4427,10 @@ export default function App() {
                   }}
                   movies={movies}
                   theme={theme}
-                  users={users}
+                  users={inviteDirectory}
                   onSendInviteToFriend={handleSendInviteToFriend}
                   onInviteClick={() => {
-                    const roomMovie = movies.find(m => m.id === activeWatchParty.movieId) || movies[0];
+                    const roomMovie = resolvePartyMovie(activeWatchParty, movies);
                     setInviteModalMovie(roomMovie);
                     setInviteModalParty(activeWatchParty);
                     setShowInviteModal(true);
@@ -3286,6 +4454,201 @@ export default function App() {
                   currentUser={currentUser}
                   theme={theme}
                 />
+                </motion.div>
+              )}
+
+              {/* SOCIAL / FRIENDS VIEW */}
+              {currentView === 'social' && currentUser && (
+                <motion.div
+                  key="social"
+                  initial={{ opacity: 0, y: 15 }}
+                  animate={{ opacity: 1, y: 0 }}
+                  exit={{ opacity: 0, y: -15 }}
+                  transition={{ duration: 0.35, ease: "easeOut" }}
+                  className="space-y-8"
+                >
+                  <div className={`p-6 sm:p-8 rounded-3xl border ${
+                    theme === 'dark' ? 'bg-zinc-900/60 border-zinc-800' : 'bg-white border-zinc-200'
+                  }`}>
+                    <h2 className="text-xl font-black font-display flex items-center gap-2">
+                      <Users className="w-5 h-5 text-red-500" /> Sosial & Dostluq
+                    </h2>
+                    <p className="text-xs text-zinc-500 mt-1">Dostluq sorğularını idarə edin, dostlarınızı görün və yeni kinosevərlər tapın.</p>
+                  </div>
+
+                  {pendingFriendRequests.length > 0 && (
+                    <div className={`p-5 rounded-2xl border space-y-3 ${
+                      theme === 'dark' ? 'bg-zinc-900/40 border-zinc-800' : 'bg-white border-zinc-200'
+                    }`}>
+                      <h3 className="text-sm font-bold flex items-center gap-2">
+                        <Bell className="w-4 h-4 text-amber-500" />
+                        Gözləyən Dostluq Sorğuları ({pendingFriendRequests.length})
+                      </h3>
+                      <div className="space-y-2">
+                        {pendingFriendRequests.map((req) => (
+                          <div
+                            key={req.id}
+                            className={`flex items-center justify-between p-3 rounded-xl border ${
+                              theme === 'dark' ? 'bg-zinc-950 border-zinc-800' : 'bg-zinc-50 border-zinc-200'
+                            }`}
+                          >
+                            <div className="flex items-center gap-3">
+                              <img
+                                src={req.senderAvatar || DEFAULT_USER_AVATAR}
+                                alt={req.senderUsername}
+                                className="w-9 h-9 rounded-full object-cover border border-zinc-700/40"
+                              />
+                              <div>
+                                <p className="text-xs font-bold">@{req.senderUsername}</p>
+                                <p className="text-[10px] text-zinc-500">Dostluq sorğusu göndərib</p>
+                              </div>
+                            </div>
+                            <div className="flex items-center gap-2">
+                              <button
+                                type="button"
+                                onClick={() => handleAcceptFriendRequest(req.id)}
+                                disabled={friendActionPending.has(`accept:${req.id}`)}
+                                className="px-3 py-1.5 bg-emerald-600 hover:bg-emerald-500 text-white text-[10px] font-bold rounded-lg transition cursor-pointer disabled:opacity-50"
+                              >
+                                Qəbul et
+                              </button>
+                              <button
+                                type="button"
+                                onClick={() => handleDeclineFriendRequest(req.id)}
+                                disabled={friendActionPending.has(`decline:${req.id}`)}
+                                className="px-3 py-1.5 bg-zinc-700 hover:bg-zinc-600 text-white text-[10px] font-bold rounded-lg transition cursor-pointer disabled:opacity-50"
+                              >
+                                Rədd et
+                              </button>
+                            </div>
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  )}
+
+                  <div className={`p-5 rounded-2xl border space-y-3 ${
+                    theme === 'dark' ? 'bg-zinc-900/40 border-zinc-800' : 'bg-white border-zinc-200'
+                  }`}>
+                    <h3 className="text-sm font-bold flex items-center gap-2">
+                      <Users className="w-4 h-4 text-red-500" />
+                      Dostlarım ({friends.length})
+                    </h3>
+                    {friends.length === 0 ? (
+                      <p className="text-xs text-zinc-500 py-4 text-center">Hələ dostunuz yoxdur. Aşağıdan istifadəçi axtarıb sorğu göndərin.</p>
+                    ) : (
+                      <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+                        {friends.map((friend) => (
+                          <div
+                            key={friend.id}
+                            className={`flex items-center justify-between p-3 rounded-xl border ${
+                              theme === 'dark' ? 'bg-zinc-950 border-zinc-800' : 'bg-zinc-50 border-zinc-200'
+                            }`}
+                          >
+                            <div className="flex items-center gap-3 min-w-0">
+                              <img
+                                src={friend.avatar || DEFAULT_USER_AVATAR}
+                                alt={friend.userName}
+                                className="w-9 h-9 rounded-full object-cover border border-zinc-700/40 shrink-0"
+                              />
+                              <p className="text-xs font-bold truncate">@{friend.userName}</p>
+                            </div>
+                            <button
+                              type="button"
+                              onClick={() => handleRemoveFriend(friend.id)}
+                              disabled={friendActionPending.has(`remove:${friend.id}`)}
+                              className="px-3 py-1.5 text-[10px] font-bold rounded-lg border border-red-500/30 text-red-400 hover:bg-red-500/10 transition cursor-pointer disabled:opacity-50 shrink-0"
+                            >
+                              Sil
+                            </button>
+                          </div>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+
+                  <div className={`p-5 rounded-2xl border space-y-4 ${
+                    theme === 'dark' ? 'bg-zinc-900/40 border-zinc-800' : 'bg-white border-zinc-200'
+                  }`}>
+                    <h3 className="text-sm font-bold flex items-center gap-2">
+                      <Search className="w-4 h-4 text-red-500" />
+                      İstifadəçi Axtar & Dostluq Sorğusu Göndər
+                    </h3>
+                    <div className="relative">
+                      <Search className="w-4 h-4 absolute left-3 top-1/2 -translate-y-1/2 text-zinc-400" />
+                      <input
+                        type="text"
+                        value={socialUserSearch}
+                        onChange={(e) => setSocialUserSearch(e.target.value)}
+                        placeholder="Ad və ya @username ilə axtar..."
+                        className={`w-full pl-9 pr-3 py-2.5 text-xs rounded-xl border outline-none transition ${
+                          theme === 'dark'
+                            ? 'bg-zinc-950 border-zinc-800 text-white focus:border-red-500'
+                            : 'bg-white border-zinc-200 text-zinc-900 focus:border-red-500'
+                        }`}
+                      />
+                    </div>
+                    {socialUserSearchLoading && (
+                      <div className="flex items-center gap-2 text-xs text-zinc-500">
+                        <Loader2 className="w-4 h-4 animate-spin" /> Axtarılır...
+                      </div>
+                    )}
+                    {!socialUserSearchLoading && socialUserSearch.trim().length >= 2 && socialUserResults.length === 0 && (
+                      <p className="text-xs text-zinc-500 text-center py-4">Nəticə tapılmadı.</p>
+                    )}
+                    <div className="space-y-2">
+                      {socialUserResults
+                        .filter((u) => String(u.id) !== currentUser.id)
+                        .map((u) => {
+                          const userId = String(u.id);
+                          const isFriend = friends.some((f) => f.id === userId);
+                          const isPending = pendingFriendRequests.some((r) => r.senderId === userId);
+                          return (
+                            <div
+                              key={userId}
+                              className={`flex items-center justify-between p-3 rounded-xl border ${
+                                theme === 'dark' ? 'bg-zinc-950 border-zinc-800' : 'bg-zinc-50 border-zinc-200'
+                              }`}
+                            >
+                              <div className="flex items-center gap-3 min-w-0">
+                                <img
+                                  src={u.avatar || DEFAULT_USER_AVATAR}
+                                  alt={u.userName}
+                                  className="w-9 h-9 rounded-full object-cover border border-zinc-700/40 shrink-0"
+                                />
+                                <div className="min-w-0">
+                                  <p className="text-xs font-bold truncate">@{u.userName}</p>
+                                  {u.fullName && <p className="text-[10px] text-zinc-500 truncate">{u.fullName}</p>}
+                                </div>
+                              </div>
+                              <div className="flex items-center gap-2 shrink-0">
+                                <button
+                                  type="button"
+                                  onClick={() => handleFollowUser(userId)}
+                                  className="px-3 py-1.5 text-[10px] font-bold rounded-lg border border-zinc-600 text-zinc-300 hover:bg-zinc-800 transition cursor-pointer"
+                                >
+                                  {currentUser.following?.includes(userId) ? 'Təqibi dayandır' : 'Təqib et'}
+                                </button>
+                                {isFriend ? (
+                                  <span className="text-[10px] font-bold text-emerald-400 px-2">Dost</span>
+                                ) : isPending ? (
+                                  <span className="text-[10px] font-bold text-amber-400 px-2">Gözləyir</span>
+                                ) : (
+                                  <button
+                                    type="button"
+                                    onClick={() => handleSendFriendRequest(userId)}
+                                    disabled={friendActionPending.has(`req:${userId}`)}
+                                    className="px-3 py-1.5 bg-red-600 hover:bg-red-500 text-white text-[10px] font-bold rounded-lg transition cursor-pointer disabled:opacity-50"
+                                  >
+                                    Sorğu göndər
+                                  </button>
+                                )}
+                              </div>
+                            </div>
+                          );
+                        })}
+                    </div>
+                  </div>
                 </motion.div>
               )}
 
@@ -3320,6 +4683,7 @@ export default function App() {
                   currentUser={currentUser}
                   theme={theme}
                   movies={movies}
+                  inviteDirectory={inviteDirectory}
                   onSelectMovie={(movie) => {
                     setSelectedMovie(movie);
                     setCurrentView('movie-details');
@@ -3394,24 +4758,15 @@ export default function App() {
                             <span className="block text-sm font-extrabold font-mono text-amber-500">{targetProfileUser.points || 0}</span>
                             <span className="text-[10px] text-zinc-500 uppercase font-semibold">Kino Xalları 🏆</span>
                           </div>
-                          <div className={`inline-flex items-center gap-1.5 px-3 py-1 rounded-xl border text-[10px] font-bold ${
-                            (targetProfileUser.points || 0) >= 500
-                              ? 'text-rose-500 border-rose-500/20 bg-rose-500/10'
-                              : (targetProfileUser.points || 0) >= 150
-                              ? 'text-amber-500 border-amber-500/20 bg-amber-500/10'
-                              : 'text-cyan-500 border-cyan-500/20 bg-cyan-500/10'
-                          }`}>
-                            <span>
-                              {(targetProfileUser.points || 0) >= 500 ? '👑' : (targetProfileUser.points || 0) >= 150 ? '✒️' : '🍿'}
-                            </span>{' '}
-                            {
-                              (targetProfileUser.points || 0) >= 500
-                                ? 'CineVerse Əfsanəsi'
-                                : (targetProfileUser.points || 0) >= 150
-                                ? 'Film Tənqidçisi'
-                                : 'Kino Həvəskarı'
-                            }
-                          </div>
+                          {(() => {
+                            const currentBadge = getHighestBadgeForPoints(targetProfileUser.points || 0);
+                            return (
+                              <div className={`inline-flex items-center gap-1.5 px-3 py-1 rounded-xl border text-[10px] font-bold ${currentBadge.color} ${currentBadge.borderColor} bg-gradient-to-r ${currentBadge.bgGradient}`}>
+                                <span>{currentBadge.icon}</span>
+                                {currentBadge.name}
+                              </div>
+                            );
+                          })()}
                         </div>
                       </div>
                     </div>
@@ -3484,7 +4839,7 @@ export default function App() {
                           <p className="text-xs text-zinc-500 py-6">Hələ heç bir sevimli film əlavə edilməyib.</p>
                         ) : (
                           <div className="grid grid-cols-2 sm:grid-cols-4 gap-4">
-                            {movies.filter(m => targetProfileUser.favorites.includes(m.id)).map(m => (
+                            {movies.filter(m => idsInclude(targetProfileUser.favorites, m.id)).map(m => (
                               <div
                                 key={m.id}
                                 onClick={() => { setSelectedMovie(m); setCurrentView('movie-details'); }}
@@ -3507,7 +4862,7 @@ export default function App() {
                           <p className="text-xs text-zinc-500 py-6">İzləmə siyahısı boşdur.</p>
                         ) : (
                           <div className="grid grid-cols-2 sm:grid-cols-4 gap-4">
-                            {movies.filter(m => targetProfileUser.watchlist.includes(m.id)).map(m => (
+                            {movies.filter(m => idsInclude(targetProfileUser.watchlist, m.id)).map(m => (
                               <div
                                 key={m.id}
                                 onClick={() => { setSelectedMovie(m); setCurrentView('movie-details'); }}
@@ -3682,13 +5037,7 @@ export default function App() {
                         {/* Interactive Play Action Buttons inside cover */}
                         <div className="flex gap-3 pt-3 flex-wrap">
                           <button
-                            onClick={() => {
-                              setActivePlayerMode('movie');
-                              rewardPoints(15, 'Film izləməyə başladığınız üçün');
-                              setTimeout(() => {
-                                document.getElementById('cinetheater-player')?.scrollIntoView({ behavior: 'smooth', block: 'center' });
-                              }, 100);
-                            }}
+                            onClick={() => handleStartWatchingMovie(selectedMovie.id)}
                             className="flex items-center gap-2 py-2.5 px-5 bg-red-600 hover:bg-red-500 text-white rounded-xl text-xs font-bold transition shadow-lg shadow-red-600/30 cursor-pointer hover:scale-[1.03] active:scale-[0.98]"
                           >
                             <Play className="w-3.5 h-3.5 fill-white text-white" /> Tam Filmi İzlə (Kino Rejimi)
@@ -3749,25 +5098,25 @@ export default function App() {
                           <button
                             onClick={() => toggleFavorite(selectedMovie.id)}
                             className={`flex items-center gap-2 py-2 px-4 rounded-xl text-xs font-semibold border transition cursor-pointer ${
-                              currentUser?.favorites.includes(selectedMovie.id)
+                              idsInclude(currentUser?.favorites, selectedMovie.id)
                                 ? 'bg-red-600/20 border-red-500 text-red-500'
                                 : 'bg-zinc-800/20 border-zinc-800 text-zinc-300 hover:bg-zinc-800/40'
                             }`}
                           >
                             <Heart className="w-4 h-4 fill-transparent" />
-                            {currentUser?.favorites.includes(selectedMovie.id) ? 'Sevimlilərdədir' : 'Sevimlilərə Əlavə Et'}
+                            {idsInclude(currentUser?.favorites, selectedMovie.id) ? 'Sevimlilərdədir' : 'Sevimlilərə Əlavə Et'}
                           </button>
 
                           <button
                             onClick={() => toggleWatchlist(selectedMovie.id)}
                             className={`flex items-center gap-2 py-2 px-4 rounded-xl text-xs font-semibold border transition cursor-pointer ${
-                              currentUser?.watchlist.includes(selectedMovie.id)
+                              idsInclude(currentUser?.watchlist, selectedMovie.id)
                                 ? 'bg-red-600/20 border-red-500 text-red-500'
                                 : 'bg-zinc-800/20 border-zinc-800 text-zinc-300 hover:bg-zinc-800/40'
                             }`}
                           >
                             <Bookmark className="w-4 h-4" />
-                            {currentUser?.watchlist.includes(selectedMovie.id) ? 'İzləmə Siyahısındadır' : 'İzləmə Siyahısına Əlavə Et'}
+                            {idsInclude(currentUser?.watchlist, selectedMovie.id) ? 'İzləmə Siyahısındadır' : 'İzləmə Siyahısına Əlavə Et'}
                           </button>
                         </div>
                       </div>
@@ -4155,11 +5504,12 @@ export default function App() {
                     <div className="lg:col-span-1 space-y-6">
                       
                       {/* Overall rating badge */}
-                      <div className={`p-5 rounded-3xl border text-center ${
-                        theme === 'dark' ? 'bg-zinc-900/40 border-zinc-800' : 'bg-white border-zinc-200'
+                      <div className={`p-5 rounded-4xl border text-center ${
+                        theme === 'dark' ? 'bg-zinc-900/40 border-zinc-500' : 'bg-white border-zinc-200'
                       }`}>
                         <h4 className="text-xs text-zinc-500 uppercase tracking-wider font-bold">CineVerse Ortaq Reytinqi</h4>
-                        <p className="text-4xl font-extrabold text-amber-500 font-mono mt-2">★ {selectedMovie.rating}</p>
+                        <p className="text-4xl font-extrabold text-amber-600 font-mono mt-2">★{Number(selectedMovie.rating).toFixed(1)}
+</p>
                         <p className="text-[10px] text-zinc-500 mt-1">İcma tərəfindən verilən ümumi xal</p>
                       </div>
 
@@ -4493,6 +5843,86 @@ export default function App() {
                     />
                   </div>
 
+                  {/* Privacy: Public vs Private (Rave-style) */}
+                  <div>
+                    <label className={`block text-[10px] font-bold uppercase tracking-wider mb-2 ${theme === 'dark' ? 'text-zinc-400' : 'text-zinc-650'}`}>
+                      Otaq Məxfiliyi
+                    </label>
+                    <div className="grid grid-cols-2 gap-2">
+                      <button
+                        type="button"
+                        onClick={() => setNewPartyIsPrivate(false)}
+                        className={`p-3 rounded-xl border text-left transition ${
+                          !newPartyIsPrivate
+                            ? 'border-emerald-500 bg-emerald-500/10'
+                            : theme === 'dark' ? 'border-zinc-800 bg-zinc-950' : 'border-zinc-200 bg-zinc-50'
+                        }`}
+                      >
+                        <div className="flex items-center gap-1.5 text-xs font-bold">
+                          <Globe className="w-3.5 h-3.5 text-emerald-500" /> Açıq otaq
+                        </div>
+                        <p className="text-[10px] text-zinc-500 mt-1 leading-snug">Hər kəs görə və qoşula bilər (Rave rejimi)</p>
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => setNewPartyIsPrivate(true)}
+                        className={`p-3 rounded-xl border text-left transition ${
+                          newPartyIsPrivate
+                            ? 'border-amber-500 bg-amber-500/10'
+                            : theme === 'dark' ? 'border-zinc-800 bg-zinc-950' : 'border-zinc-200 bg-zinc-50'
+                        }`}
+                      >
+                        <div className="flex items-center gap-1.5 text-xs font-bold">
+                          <Lock className="w-3.5 h-3.5 text-amber-500" /> Məxfi otaq
+                        </div>
+                        <p className="text-[10px] text-zinc-500 mt-1 leading-snug">Yalnız dəvət etdiyiniz dostlar qoşula bilər</p>
+                      </button>
+                    </div>
+                  </div>
+
+                  {/* Premium room toggle (Premium users only) */}
+                  <div>
+                    <label className={`block text-[10px] font-bold uppercase tracking-wider mb-2 ${theme === 'dark' ? 'text-zinc-400' : 'text-zinc-650'}`}>
+                      Premium Otaq
+                    </label>
+                    {currentUser?.isPremium ? (
+                      <button
+                        type="button"
+                        onClick={() => setNewPartyIsPremium((prev) => !prev)}
+                        className={`w-full p-3 rounded-xl border text-left transition ${
+                          newPartyIsPremium
+                            ? 'border-amber-500 bg-amber-500/10'
+                            : theme === 'dark' ? 'border-zinc-800 bg-zinc-950' : 'border-zinc-200 bg-zinc-50'
+                        }`}
+                      >
+                        <div className="flex items-center gap-1.5 text-xs font-bold">
+                          <Sparkles className="w-3.5 h-3.5 text-amber-500" />
+                          {newPartyIsPremium ? 'Premium otaq aktivdir' : 'Adi otaq'}
+                        </div>
+                        <p className="text-[10px] text-zinc-500 mt-1 leading-snug">
+                          Premium otaqlara yalnız Premium abunəçilər qoşula bilər
+                        </p>
+                      </button>
+                    ) : (
+                      <button
+                        type="button"
+                        onClick={() => setShowPremiumModal(true)}
+                        className={`w-full p-3 rounded-xl border border-dashed text-left transition ${
+                          theme === 'dark'
+                            ? 'border-amber-500/30 bg-amber-500/5 hover:bg-amber-500/10'
+                            : 'border-amber-300 bg-amber-50 hover:bg-amber-100'
+                        }`}
+                      >
+                        <div className="flex items-center gap-1.5 text-xs font-bold text-amber-500">
+                          <Sparkles className="w-3.5 h-3.5" /> Premium otaq yaratmaq üçün abunə olun
+                        </div>
+                        <p className="text-[10px] text-zinc-500 mt-1 leading-snug">
+                          Ekskluziv Watch Party otaqları yalnız Premium üzvlər üçündür
+                        </p>
+                      </button>
+                    )}
+                  </div>
+
                   {/* Toggle Custom / External Movie */}
                   <div className="flex items-center gap-2 py-1">
                     <input
@@ -4605,7 +6035,8 @@ export default function App() {
             onClose={() => setShowInviteModal(false)}
             movies={movies}
             currentUser={currentUser}
-            users={users}
+            users={inviteDirectory}
+            inviteDirectory={inviteDirectory}
             theme={theme}
             selectedMovie={inviteModalMovie}
             activeParty={inviteModalParty}
@@ -4621,17 +6052,6 @@ export default function App() {
             theme={theme}
             onUpgradeSuccess={(updatedUser) => {
               setCurrentUser(updatedUser);
-              
-              // Also add a custom notification for the upgrade!
-              const newNotif: Notification = {
-                id: 'notif_premium_' + Date.now(),
-                title: 'Premium Aktiv Edildi! 💎',
-                description: 'CineVerse Premium statusunuz uğurla aktivləşdirildi! 4K yayımlar və üstünlüklər sizi gözləyir.',
-                type: 'system',
-                date: 'İndi',
-                read: false
-              };
-              setNotifications(prev => [newNotif, ...prev]);
             }}
           />
 
@@ -4671,21 +6091,20 @@ export default function App() {
                       <span className="absolute left-3.5 top-1/2 -translate-y-1/2 text-red-500 font-bold font-mono text-xs">@</span>
                       <input
                         type="text"
-                        required
+                        readOnly
+                        disabled
                         value={editUsername}
-                        onChange={(e) => {
-                          // Allow lowercase alphanumeric and underscore only, like Instagram handle
-                          const val = e.target.value.toLowerCase().replace(/[^a-z0-9_]/g, '');
-                          setEditUsername(val);
-                        }}
                         placeholder="elnar_agasoy"
-                        className={`w-full pl-7 pr-3.5 py-2.5 rounded-xl text-xs focus:outline-none border transition-all duration-300 ${
+                        className={`w-full pl-7 pr-3.5 py-2.5 rounded-xl text-xs focus:outline-none border transition-all duration-300 cursor-not-allowed opacity-70 ${
                           theme === 'dark' 
-                            ? 'bg-zinc-950 border-zinc-800 text-white placeholder-zinc-650 focus:border-red-650' 
-                            : 'bg-zinc-50 border-zinc-200 text-zinc-900 placeholder-zinc-455 focus:border-red-550'
+                            ? 'bg-zinc-950 border-zinc-800 text-zinc-400 placeholder-zinc-650' 
+                            : 'bg-zinc-100 border-zinc-200 text-zinc-500 placeholder-zinc-400'
                         }`}
                       />
                     </div>
+                    <p className={`mt-1.5 text-[10px] ${theme === 'dark' ? 'text-zinc-500' : 'text-zinc-500'}`}>
+                      İstifadəçi adı backend tərəfindən dəyişdirilə bilmir
+                    </p>
                   </div>
 
                   <div>
@@ -4736,6 +6155,70 @@ export default function App() {
                     </button>
                   </div>
                 </form>
+
+                <div className={`mt-6 pt-5 border-t ${theme === 'dark' ? 'border-zinc-800' : 'border-zinc-200'}`}>
+                  <h4 className="text-sm font-bold mb-1">Şifrəni Dəyiş</h4>
+                  <p className={`text-[11px] mb-3 ${theme === 'dark' ? 'text-zinc-500' : 'text-zinc-600'}`}>
+                    Hesab təhlükəsizliyiniz üçün şifrənizi buradan yeniləyə bilərsiniz.
+                  </p>
+
+                  {passwordChangeError && (
+                    <div className="mb-3 p-2.5 rounded-xl bg-red-500/10 border border-red-500/20 text-red-400 text-xs">
+                      {passwordChangeError}
+                    </div>
+                  )}
+                  {passwordChangeSuccess && (
+                    <div className="mb-3 p-2.5 rounded-xl bg-emerald-500/10 border border-emerald-500/20 text-emerald-400 text-xs">
+                      {passwordChangeSuccess}
+                    </div>
+                  )}
+
+                  <form onSubmit={handleChangePassword} className="space-y-3">
+                    <input
+                      type="password"
+                      required
+                      value={editCurrentPassword}
+                      onChange={(e) => setEditCurrentPassword(e.target.value)}
+                      placeholder="Cari şifrə"
+                      className={`w-full px-3.5 py-2.5 rounded-xl text-xs focus:outline-none border ${
+                        theme === 'dark'
+                          ? 'bg-zinc-950 border-zinc-800 text-white placeholder-zinc-650'
+                          : 'bg-zinc-50 border-zinc-200 text-zinc-900 placeholder-zinc-400'
+                      }`}
+                    />
+                    <input
+                      type="password"
+                      required
+                      value={editNewPassword}
+                      onChange={(e) => setEditNewPassword(e.target.value)}
+                      placeholder="Yeni şifrə"
+                      className={`w-full px-3.5 py-2.5 rounded-xl text-xs focus:outline-none border ${
+                        theme === 'dark'
+                          ? 'bg-zinc-950 border-zinc-800 text-white placeholder-zinc-650'
+                          : 'bg-zinc-50 border-zinc-200 text-zinc-900 placeholder-zinc-400'
+                      }`}
+                    />
+                    <input
+                      type="password"
+                      required
+                      value={editConfirmPassword}
+                      onChange={(e) => setEditConfirmPassword(e.target.value)}
+                      placeholder="Yeni şifrəni təsdiqlə"
+                      className={`w-full px-3.5 py-2.5 rounded-xl text-xs focus:outline-none border ${
+                        theme === 'dark'
+                          ? 'bg-zinc-950 border-zinc-800 text-white placeholder-zinc-650'
+                          : 'bg-zinc-50 border-zinc-200 text-zinc-900 placeholder-zinc-400'
+                      }`}
+                    />
+                    <button
+                      type="submit"
+                      disabled={isChangingPassword}
+                      className="w-full py-2.5 rounded-xl text-xs font-semibold bg-zinc-800 hover:bg-zinc-700 text-white transition cursor-pointer disabled:opacity-50"
+                    >
+                      {isChangingPassword ? 'Yenilənir...' : 'Şifrəni Yenilə'}
+                    </button>
+                  </form>
+                </div>
               </div>
             </div>
           )}
@@ -4790,7 +6273,7 @@ export default function App() {
                         : 'text-zinc-500 hover:text-zinc-400'
                     }`}
                   >
-                    İzləyicilər ({socialModalUser.followers?.length || 0})
+                    İzləyicilər ({socialModalFollowersCount})
                   </button>
                   <button
                     onClick={() => {
@@ -4803,81 +6286,91 @@ export default function App() {
                         : 'text-zinc-500 hover:text-zinc-400'
                     }`}
                   >
-                    İzlənilənlər ({socialModalUser.following?.length || 0})
+                    İzlənilənlər ({socialModalFollowingCount})
                   </button>
                 </div>
 
-                {/* Users List */}
-                <div className="flex-1 overflow-y-auto space-y-3 pr-1">
-                  {socialUsersList.length === 0 ? (
-                    <p className="text-xs text-zinc-500 py-8 text-center">
-                      {socialSearchQuery ? 'Uyğun nəticə tapılmadı.' : 'Hələ heç kim yoxdur.'}
-                    </p>
-                  ) : (
-                    socialUsersList.map((u) => {
-                      const isCurrentUser = u.id === currentUser.id;
-                      const amIFollowing = currentUser.following.includes(u.id);
-                      return (
-                        <div key={u.id} className="flex items-center justify-between text-xs">
-                          <div 
-                            onClick={() => {
-                              navigateToUserProfileById(u.id);
-                              setShowSocialModal(false);
-                            }}
-                            className="flex items-center gap-2.5 cursor-pointer hover:opacity-85 transition"
-                          >
-                            <img src={u.avatar} alt={u.name} className="w-8 h-8 rounded-full object-cover" />
-                            <div>
-                              <p className="font-semibold leading-none">{u.name}</p>
-                              <p className="text-[10px] text-zinc-500 mt-1">@{u.username}</p>
-                            </div>
-                          </div>
+{/* Users List */}
+<div className="flex-1 overflow-y-auto space-y-3 pr-1">
+  {isSocialLoading ? (
+    <p className="text-xs text-zinc-500 py-8 text-center animate-pulse">Yüklənir...</p>
+  ) : socialLiveUsers.length === 0 ? (
+    <p className="text-xs text-zinc-500 py-8 text-center">
+      Heç bir istifadəçi tapılmadı.
+    </p>
+  ) : (
+    socialLiveUsers.map((item, idx) => {
+      // İç içə nesne çözümü
+      const u = item.user || item.followerUser || item.followingUser || item;
+      
+      const userId = u.id || u.userId || u.followerId || u.followingId || `idx-${idx}`;
+      const username = u.userName || u.username || 'user';
+      const name = u.fullName || u.name || username;
+      
+      // Resim URL eşleşmesi - Tüm olasılıklar ve eğer hiçbiri yoksa şık bir harf ikonu simülasyonu
+      const avatarUrl = u.avatarUrl || u.avatar || u.AvatarUrl || u.Avatar;
+      const hasAvatar = avatarUrl && avatarUrl.trim().length > 0 && !avatarUrl.includes('null');
 
-                          {!isCurrentUser && (
-                            <button
-                              onClick={() => {
-                                handleFollowUser(u.id);
-                                // Dynamic live update inside modal
-                                if (socialModalUser.id === currentUser.id) {
-                                  setSocialModalUser(prev => {
-                                    if (!prev) return null;
-                                    const nextFollowing = prev.following.includes(u.id)
-                                      ? prev.following.filter(id => id !== u.id)
-                                      : [...prev.following, u.id];
-                                    return {
-                                      ...prev,
-                                      following: nextFollowing,
-                                      followingCount: nextFollowing.length
-                                    };
-                                  });
-                                } else if (socialModalUser.id === u.id) {
-                                  setSocialModalUser(prev => {
-                                    if (!prev) return null;
-                                    const nextFollowers = prev.followers.includes(currentUser.id)
-                                      ? prev.followers.filter(id => id !== currentUser.id)
-                                      : [...prev.followers, currentUser.id];
-                                    return {
-                                      ...prev,
-                                      followers: nextFollowers,
-                                      followersCount: nextFollowers.length
-                                    };
-                                  });
-                                }
-                              }}
-                              className={`py-1 px-3 text-[10px] font-bold rounded-xl transition cursor-pointer ${
-                                amIFollowing
-                                  ? 'bg-zinc-800 text-zinc-400 hover:bg-zinc-700/80'
-                                  : 'bg-red-600 text-white hover:bg-red-500'
-                              }`}
-                            >
-                              {amIFollowing ? 'İzlənilir' : 'İzlə'}
-                            </button>
-                          )}
-                        </div>
-                      );
-                    })
-                  )}
-                </div>
+      const isCurrentUser = userId === currentUser?.id;
+      const amIFollowing = currentUser?.following?.includes(userId);
+
+      return (
+        <div key={userId} className="flex items-center justify-between text-xs py-1">
+          <div 
+            onClick={() => { 
+              navigateToUserProfileById(userId); 
+              setShowSocialModal(false); 
+            }} 
+            className="flex items-center gap-2.5 cursor-pointer hover:opacity-85 transition"
+          >
+            {hasAvatar ? (
+              <img 
+                src={avatarUrl} 
+                alt={name} 
+                className="w-8 h-8 rounded-full object-cover border border-zinc-800/40"
+                onError={(e) => {
+                  // Link kırıksa görseli gizle ve harf dairesine dönüştür
+                  e.currentTarget.style.display = 'none';
+                  const sibling = e.currentTarget.nextElementSibling as HTMLElement;
+                  if (sibling) sibling.style.display = 'flex';
+                }}
+              />
+            ) : null}
+
+            {/* Logo boş veya kırık olduğunda çalışacak harf ikonu (Sarı/Kırmızı yuvarlak) */}
+            {(!hasAvatar || avatarUrl) && (
+              <div 
+                className="w-8 h-8 rounded-full bg-red-600/20 border border-red-500/30 text-red-500 flex items-center justify-center font-bold uppercase text-[11px]"
+                style={{ display: hasAvatar ? 'none' : 'flex' }}
+              >
+                {name.charAt(0)}
+              </div>
+            )}
+
+            <div>
+              <p className="font-semibold leading-none text-white">{name}</p>
+              <p className="text-[10px] text-zinc-500 mt-1">@{username}</p>
+            </div>
+          </div>
+          
+          {!isCurrentUser && (
+            <button 
+              onClick={() => handleFollowUser(userId)} 
+              className={`py-1 px-3 text-[10px] font-bold rounded-xl transition cursor-pointer ${
+                amIFollowing ? 'bg-zinc-800 text-zinc-400 hover:bg-zinc-700/80' : 'bg-red-600 text-white hover:bg-red-500'
+              }`}
+            >
+              {amIFollowing ? 'İzlənilir' : 'İzlə'}
+            </button>
+          )}
+        </div>
+      );
+    })
+  )}
+</div>
+
+
+
               </div>
             </div>
           )}

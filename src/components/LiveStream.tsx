@@ -2,21 +2,41 @@ import React, { useState, useEffect, useRef } from 'react';
 import { motion } from 'motion/react';
 import { 
   Radio, Play, Pause, Send, Volume2, Users, Maximize, MessageSquare, 
-  Sparkles, Flame, Eye, Film, Tv, Trophy, Shield, VolumeX, AlertTriangle, ScreenShare, Calendar, Edit3, Trash2
+  Sparkles, Flame, Eye, Film, Tv, Trophy, Shield, VolumeX, AlertTriangle, ScreenShare, Calendar, Edit3, Trash2, Loader2
 } from 'lucide-react';
 import { User } from '../types';
+import EmptyState from './EmptyState';
+import { useLiveStreamsQuery, useLiveStreamScheduleQuery } from '../hooks/useApiQueries';
 import { 
-  apiGetLiveStreams, 
   apiGetLiveStreamChatHistory, 
-  apiSendLiveStreamMessage, 
-  apiGetLiveStreamSchedule,
-  apiUpdateChatMessage,
-  apiDeleteChatMessage,
-  LiveStreamScheduleDto 
+  apiSendLiveStreamMessage,
+  apiUpdateLiveStreamMessage,
+  apiDeleteLiveStreamMessage,
 } from '../api';
+import {
+  joinStreamGroup,
+  leaveStreamGroup,
+  sendStreamMessage,
+  sendStreamReaction,
+  onReceiveStreamMessage,
+  offReceiveStreamMessage,
+  onStreamMessageUpdated,
+  offStreamMessageUpdated,
+  onStreamMessageDeleted,
+  offStreamMessageDeleted,
+  onUpdateViewerCount,
+  offUpdateViewerCount,
+  onReceiveReaction,
+  offReceiveReaction,
+  type StreamReactionPayload,
+} from '../signalr';
+import { normalizeEntityId } from '../utils/entityIds';
+import { getStreamPlaybackInfo } from '../utils/streamPlayback';
+import { isOwnChatMessage, coalesceAvatar, resolveChatAvatar, DEFAULT_CHAT_AVATAR } from '../utils/watchPartyUtils';
+import toast from 'react-hot-toast';
 
 interface LiveStreamProps {
-  currentUser: User;
+  currentUser: User | null;
   theme: 'dark' | 'light';
   isCinemaMode: boolean;
   setIsCinemaMode: (val: boolean) => void;
@@ -24,6 +44,7 @@ interface LiveStreamProps {
 
 interface ChatMessage {
   id: string;
+  senderId?: string;
   sender: string;
   avatar: string;
   message: string;
@@ -32,64 +53,17 @@ interface ChatMessage {
   badge?: string;
 }
 
-const LIVE_STREAMS = [
-  {
-    id: 'stream_1',
-    channelKey: 'nolan-marathon',
-    title: 'Xüsusi Christopher Nolan Marafonu 🎬',
-    description: 'Nolanın şah əsərləri ard-arda və kəsintisiz yayımda: Interstellar, Inception, Tenet, Oppenheimer.',
-    streamUrl: 'https://www.youtube.com/embed/coYw-b1_NIs', // Interstellar trailer theme
-    category: 'Film Marafonu',
-    views: '1,450',
-    ambientColor: 'rgba(147, 51, 234, 0.4)', // Purple
-    banner: 'https://images.unsplash.com/photo-1419242902214-272b3f66ee7a?w=1200&auto=format&fit=crop&q=80',
-    typeIcon: Film
-  },
-  {
-    id: 'stream_2',
-    channelKey: 'affa-derby',
-    title: 'AFFA Çempionlar Liqası Finalı: Qarabağ FK - Neftçi PFK 🏆⚽',
-    description: 'Azərbaycan futbolunun möhtəşəm canlı derbi qarşıdurması. CineVerse platformasında eksklüziv canlı yayım!',
-    streamUrl: 'https://www.youtube.com/embed/8vOaE-3qTIs', // Stadium scene or soccer theme
-    category: 'İdman Canlı',
-    views: '4,890',
-    ambientColor: 'rgba(16, 185, 129, 0.4)', // Green
-    banner: 'https://images.unsplash.com/photo-1508098682722-e99c43a406b2?w=1200&auto=format&fit=crop&q=80',
-    typeIcon: Trophy
-  },
-  {
-    id: 'stream_3',
-    channelKey: 'cinemax-4k',
-    title: 'CineMax 4K Canlı TV Yayımı 🍿',
-    description: 'Dünya şöhrətli blokbasterlər, kinofilm xəbərləri, xüsusi intervyular və ən son məlumatlar 24/7 canlı yayımda.',
-    streamUrl: 'https://www.youtube.com/embed/6_fAtx6e_Z8', // Movie clips
-    category: 'Canlı TV',
-    views: '830',
-    ambientColor: 'rgba(239, 68, 68, 0.4)', // Red
-    banner: 'https://images.unsplash.com/photo-1489599849927-2ee91cede3ba?w=1200&auto=format&fit=crop&q=80',
-    typeIcon: Tv
-  }
-];
+interface FloatingReaction {
+  id: string;
+  emoji: string;
+  left: number;
+}
 
-const MOCK_NAMES = [
-  'Elvin_H', 'Leyla_Aliyeva', 'Kanan_K', 'Aysel_99', 'Nurlan_FK', 'Gunel_S', 
-  'Murad_Baku', 'Camil_A', 'Sabina_M', 'Emin_NolanFan', 'Rauf_Cinephile', 'Zahra_K'
-];
-
-const MOCK_MESSAGES_POOL = [
-  'Vallah əla yayındır, keyfiyyətə söz ola bilməz! 👍',
-  'Bu səhnəni neçənci dəfə izləyirəm hələ də tüklərim ürpəşir..',
-  'Səsi bir az artıra bilərsiniz?',
-  'Qarabağ irəli! Çempion kim olacaq görəsən?',
-  'Nolan həqiqətən dahi rejissordur, hər kadrı sənətdir.',
-  'Kinoteatr rejimi düyməsini basanda parıltı effekti möhtəşəm görünür, sınaqdan keçirin mütləq!',
-  'CineVerse komandasına təşəkkürlər belə marafonlara görə.',
-  'Dostlarımı da bura dəvət elədim, indi hamımız burdayıq 😂🍻',
-  'Interstellar musiqisi Hans Zimmerin ən pik işidir.',
-  'Uşaqlar, kim bilir növbəti film nə olacaq yayımda?',
-  'Bu gün bura yığışmaq lap əla oldu, xüsusilə də canli çat olması.',
-  'Yayımı bəyənin, hamı görsün canlını!'
-];
+const STREAM_REACTION_EMOJI: Record<'heart' | 'fire' | 'clap', string> = {
+  heart: '❤️',
+  fire: '🔥',
+  clap: '👏',
+};
 
 const USERNAME_COLORS = [
   'text-rose-400', 'text-amber-400', 'text-emerald-400', 'text-sky-400',
@@ -103,124 +77,127 @@ export default function LiveStream({
   isCinemaMode,
   setIsCinemaMode
 }: LiveStreamProps) {
-  const [streamsList, setStreamsList] = useState(LIVE_STREAMS);
-  const [selectedStream, setSelectedStream] = useState<any>(LIVE_STREAMS[0]);
+  const [streamsList, setStreamsList] = useState<any[]>([]);
+  const [selectedStream, setSelectedStream] = useState<any | null>(null);
+  const { data: apiStreams, isLoading: isStreamsLoading, refetch: refetchStreams } = useLiveStreamsQuery();
+  const { data: scheduleData } = useLiveStreamScheduleQuery();
   const [isPlaying, setIsPlaying] = useState(true);
   const [isMuted, setIsMuted] = useState(false);
   const [ambientGlowEnabled, setAmbientGlowEnabled] = useState(true);
   const [chatMessages, setChatMessages] = useState<ChatMessage[]>([]);
   const [newMessageText, setNewMessageText] = useState('');
+  const [floatingReactions, setFloatingReactions] = useState<FloatingReaction[]>([]);
   const [editingMsgId, setEditingMsgId] = useState<string | null>(null);
   const [editingMsgText, setEditingMsgText] = useState('');
-  const [schedules, setSchedules] = useState<LiveStreamScheduleDto[]>([]);
   const chatEndRef = useRef<HTMLDivElement>(null);
+  const schedules = Array.isArray(scheduleData) ? scheduleData : [];
+  const selectedStreamId = selectedStream?.id ?? null;
+
+  const isBackendStreamId = (id: string | null | undefined) =>
+    !!id && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(id);
 
   const handleSaveEditMessage = async (msgId: string) => {
-    if (!editingMsgText.trim()) return;
+    if (!editingMsgText.trim() || !isBackendStreamId(msgId)) return;
     const trimmed = editingMsgText.trim();
+    const previousMessages = chatMessages;
     setChatMessages(prev => prev.map(m => m.id === msgId ? { ...m, message: trimmed } : m));
     setEditingMsgId(null);
     setEditingMsgText('');
     try {
-      await apiUpdateChatMessage(msgId, trimmed);
-    } catch (err) {
+      await apiUpdateLiveStreamMessage(msgId, trimmed);
+    } catch (err: any) {
       console.error('Mesaj redaktə edilərkən xəta:', err);
+      setChatMessages(previousMessages);
+      toast.error(err?.message || 'Mesaj redaktə edilə bilmədi.');
     }
   };
 
   const handleDeleteMessage = async (msgId: string) => {
+    if (!msgId) {
+      toast.error('Mesaj ID-si tapılmadı.');
+      return;
+    }
+    if (!isBackendStreamId(msgId)) {
+      setChatMessages(prev => prev.filter(m => m.id !== msgId));
+      return;
+    }
+    const previousMessages = chatMessages;
     setChatMessages(prev => prev.filter(m => m.id !== msgId));
     try {
-      await apiDeleteChatMessage(msgId);
-    } catch (err) {
+      await apiDeleteLiveStreamMessage(msgId);
+    } catch (err: any) {
       console.error('Mesaj silinərkən xəta:', err);
+      setChatMessages(previousMessages);
+      toast.error(err?.message || 'Mesaj silinə bilmədi.');
     }
   };
 
-  // Fetch LiveStreams from API on mount
+  // Backend-dən yalnız CANLI (isLive) kanalları yüklə
   useEffect(() => {
-    async function loadStreams() {
-      try {
-        const apiStreams = await apiGetLiveStreams();
-        if (Array.isArray(apiStreams) && apiStreams.length > 0) {
-          const mapped = apiStreams.map((s) => ({
-            id: s.id,
-            channelKey: s.channelKey,
-            title: s.title,
-            description: s.description || 'Canlı yayım',
-            streamUrl: s.streamUrl.includes('youtube') ? s.streamUrl : 'https://www.youtube.com/embed/coYw-b1_NIs',
-            category: s.category || 'Canlı',
-            views: s.viewerCount ? s.viewerCount.toLocaleString() : '1,200',
-            ambientColor: 'rgba(239, 68, 68, 0.4)',
-            banner: s.thumbnailUrl || 'https://images.unsplash.com/photo-1489599849927-2ee91cede3ba?w=1200&auto=format&fit=crop&q=80',
-            typeIcon: Tv
-          }));
-          setStreamsList(mapped);
-          setSelectedStream(mapped[0]);
-        }
-      } catch (err) {
-        console.log('Backend streams fetch notice (using fallback streams):', err);
-      }
+    if (!Array.isArray(apiStreams)) {
+      return;
     }
 
-    async function loadSchedule() {
-      try {
-        const sched = await apiGetLiveStreamSchedule();
-        if (Array.isArray(sched)) {
-          setSchedules(sched);
-        }
-      } catch (err) {
-        // quiet fallback
-      }
+    const liveOnly = apiStreams.filter((s: any) => s.isLive === true || s.IsLive === true);
+
+    if (liveOnly.length === 0) {
+      setStreamsList([]);
+      setSelectedStream(null);
+      return;
     }
 
-    loadStreams();
-    loadSchedule();
-  }, []);
+    const mapped = liveOnly.map((s: any) => ({
+      id: normalizeEntityId(s.id ?? s.Id),
+      channelKey: s.channelKey ?? s.ChannelKey ?? '',
+      title: s.title ?? s.Title ?? 'Canlı yayım',
+      description: s.description ?? s.Description ?? 'Canlı yayım',
+      streamUrl: s.streamUrl ?? s.StreamUrl ?? '',
+      category: s.category ?? s.Category ?? 'Canlı',
+      views: (s.viewerCount ?? s.ViewerCount ?? 0).toLocaleString(),
+      ambientColor: 'rgba(239, 68, 68, 0.4)',
+      banner: s.thumbnailUrl ?? s.ThumbnailUrl ?? 'https://images.unsplash.com/photo-1489599849927-2ee91cede3ba?w=1200&auto=format&fit=crop&q=80',
+      typeIcon: Tv,
+    }));
+    setStreamsList(mapped);
+    setSelectedStream((prev) => mapped.find((s) => s.id === prev?.id) || mapped[0]);
+  }, [apiStreams]);
 
-  // Initialize with chat history from API or mock chat history
+  // Backend-dən çat tarixçəsini yüklə
   useEffect(() => {
+    if (!selectedStream) return;
+
     let isCancelled = false;
 
     async function loadChatHistory() {
       try {
         const history = await apiGetLiveStreamChatHistory(selectedStream.id);
         if (!isCancelled && Array.isArray(history) && history.length > 0) {
-          const mapped: ChatMessage[] = history.map((m, idx) => ({
-            id: m.id || `hist_${idx}`,
-            sender: m.userName || 'Anonim',
-            avatar: m.userAvatar || 'https://images.unsplash.com/photo-1535713875002-d1d0cf377fde?w=60&auto=format&fit=crop&q=80',
-            message: m.message,
-            colorClass: USERNAME_COLORS[idx % USERNAME_COLORS.length],
-            timestamp: m.createdAt ? new Date(m.createdAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : 'İndi',
-            badge: m.userId ? 'Aktiv' : undefined
-          }));
+          const mapped: ChatMessage[] = history.map((m: any, idx) => {
+            const id = String(m.id ?? m.Id ?? '');
+            const senderId = String(m.userId ?? m.UserId ?? '');
+            const sender = String(m.userName ?? m.UserName ?? m.username ?? m.Username ?? 'Anonim');
+            return {
+              id: id || `hist_${idx}`,
+              senderId: senderId || undefined,
+              sender,
+              avatar: coalesceAvatar(m.userAvatar, m.UserAvatar),
+              message: String(m.message ?? m.Message ?? m.messageText ?? m.MessageText ?? ''),
+              colorClass: USERNAME_COLORS[idx % USERNAME_COLORS.length],
+              timestamp: (m.createdAt ?? m.CreatedAt)
+                ? new Date(String(m.createdAt ?? m.CreatedAt)).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
+                : 'İndi',
+              badge: senderId ? 'Aktiv' : undefined,
+            };
+          });
           setChatMessages(mapped);
           return;
         }
       } catch {
-        // Fallback to mock messages
+        // empty chat
       }
 
       if (!isCancelled) {
-        const initialMessages: ChatMessage[] = [];
-        const now = new Date();
-        for (let i = 5; i > 0; i--) {
-          const timeStr = new Date(now.getTime() - i * 60 * 1000).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
-          const randomName = MOCK_NAMES[Math.floor(Math.random() * MOCK_NAMES.length)];
-          const randomMsg = MOCK_MESSAGES_POOL[Math.floor(Math.random() * MOCK_MESSAGES_POOL.length)];
-          const randomColor = USERNAME_COLORS[Math.floor(Math.random() * USERNAME_COLORS.length)];
-          initialMessages.push({
-            id: `init_${i}`,
-            sender: randomName,
-            avatar: `https://images.unsplash.com/photo-${1500000000000 + Math.floor(Math.random() * 1000000)}?w=60&auto=format&fit=crop&q=80`,
-            message: randomMsg,
-            colorClass: randomColor,
-            timestamp: timeStr,
-            badge: Math.random() > 0.7 ? 'Premium' : undefined
-          });
-        }
-        setChatMessages(initialMessages);
+        setChatMessages([]);
       }
     }
 
@@ -231,32 +208,86 @@ export default function LiveStream({
     };
   }, [selectedStream]);
 
-  // Simulate active viewers talking in chat
+  // LiveStreamHub-a qoşulma: real-time mesajlar və izləyici sayı
   useEffect(() => {
-    if (!isPlaying) return;
+    if (!selectedStreamId || !currentUser?.id) return;
 
-    const interval = setInterval(() => {
-      const randomName = MOCK_NAMES[Math.floor(Math.random() * MOCK_NAMES.length)];
-      const randomMsg = MOCK_MESSAGES_POOL[Math.floor(Math.random() * MOCK_MESSAGES_POOL.length)];
-      const randomColor = USERNAME_COLORS[Math.floor(Math.random() * USERNAME_COLORS.length)];
-      const nowStr = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+    if (!isBackendStreamId(selectedStreamId)) return;
 
+    joinStreamGroup(selectedStreamId).catch(err =>
+      console.error('Canlı yayım qrupuna qoşulma xətası:', err)
+    );
+
+    const handleIncomingMessage = (msg: any) => {
+      const msgId = String(msg.id ?? msg.Id ?? `live_${Date.now()}`);
+      const senderId = String(msg.userId ?? msg.UserId ?? '');
+      const sender = String(msg.userName ?? msg.UserName ?? msg.username ?? msg.Username ?? 'Anonim');
+      const message = String(msg.message ?? msg.Message ?? msg.messageText ?? msg.MessageText ?? '');
       setChatMessages((prev) => [
         ...prev,
         {
-          id: `sim_${Date.now()}`,
-          sender: randomName,
-          avatar: `https://images.unsplash.com/photo-${1500000000000 + Math.floor(Math.random() * 900000)}?w=60&auto=format&fit=crop&q=80`,
-          message: randomMsg,
-          colorClass: randomColor,
-          timestamp: nowStr,
-          badge: Math.random() > 0.8 ? 'CineFan' : undefined
+          id: msgId,
+          senderId: senderId || undefined,
+          sender,
+          avatar: coalesceAvatar(msg.userAvatar, msg.UserAvatar),
+          message,
+          colorClass: senderId && normalizeEntityId(senderId) === normalizeEntityId(currentUser.id)
+            ? 'text-red-500 font-bold'
+            : USERNAME_COLORS[Math.floor(Math.random() * USERNAME_COLORS.length)],
+          timestamp: (msg.createdAt ?? msg.CreatedAt)
+            ? new Date(String(msg.createdAt ?? msg.CreatedAt)).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
+            : 'İndi',
+          badge: senderId && normalizeEntityId(senderId) === normalizeEntityId(currentUser.id) ? 'Sən' : undefined,
         }
-      ].slice(-100)); // Keep last 100 messages for performance
-    }, 4500);
+      ].slice(-100));
+    };
 
-    return () => clearInterval(interval);
-  }, [isPlaying]);
+    const handleViewerCount = (count: number) => {
+      setStreamsList((prev) => prev.map(s => s.id === selectedStreamId ? { ...s, views: count.toLocaleString() } : s));
+    };
+
+    const handleMessageUpdated = (payload: { id?: string; Id?: string; message?: string; Message?: string }) => {
+      const msgId = String(payload.id ?? payload.Id ?? '');
+      const text = String(payload.message ?? payload.Message ?? '');
+      if (!msgId || !text) return;
+      setChatMessages((prev) => prev.map((m) => (m.id === msgId ? { ...m, message: text } : m)));
+    };
+
+    const handleMessageDeleted = (payload: { id?: string; Id?: string }) => {
+      const msgId = String(payload.id ?? payload.Id ?? '');
+      if (!msgId) return;
+      setChatMessages((prev) => prev.filter((m) => m.id !== msgId));
+    };
+
+    const handleIncomingReaction = (payload: StreamReactionPayload & { ReactionType?: string; Username?: string }) => {
+      const reactionType = (payload.reactionType ?? payload.ReactionType ?? 'heart') as 'heart' | 'fire' | 'clap';
+      const emoji = STREAM_REACTION_EMOJI[reactionType] || '❤️';
+      const newReaction: FloatingReaction = {
+        id: 'reaction_' + Math.random(),
+        emoji,
+        left: Math.random() * 80 + 10,
+      };
+      setFloatingReactions((prev) => [...prev, newReaction]);
+      setTimeout(() => {
+        setFloatingReactions((prev) => prev.filter((r) => r.id !== newReaction.id));
+      }, 3000);
+    };
+
+    onReceiveStreamMessage(handleIncomingMessage);
+    onStreamMessageUpdated(handleMessageUpdated);
+    onStreamMessageDeleted(handleMessageDeleted);
+    onUpdateViewerCount(handleViewerCount);
+    onReceiveReaction(handleIncomingReaction);
+
+    return () => {
+      offReceiveStreamMessage(handleIncomingMessage);
+      offStreamMessageUpdated(handleMessageUpdated);
+      offStreamMessageDeleted(handleMessageDeleted);
+      offUpdateViewerCount(handleViewerCount);
+      offReceiveReaction(handleIncomingReaction);
+      leaveStreamGroup(selectedStreamId).catch(() => {});
+    };
+  }, [selectedStreamId, currentUser?.id]);
 
   // Scroll to bottom of chat whenever messages list updates
   useEffect(() => {
@@ -265,39 +296,85 @@ export default function LiveStream({
 
   const handleSendChat = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!newMessageText.trim()) return;
-
     const msgContent = newMessageText.trim();
-    const nowStr = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
-    
-    const userMsg: ChatMessage = {
-      id: `user_${Date.now()}`,
-      sender: currentUser.name,
-      avatar: currentUser.avatar,
-      message: msgContent,
-      colorClass: 'text-red-500 font-bold',
-      timestamp: nowStr,
-      badge: 'Sən'
-    };
+    if (!msgContent || !selectedStream || !currentUser) return;
 
-    setChatMessages((prev) => [...prev, userMsg]);
     setNewMessageText('');
 
-    // Attempt backend API call to persist live stream message
-    try {
-      await apiSendLiveStreamMessage({
-        liveStreamId: selectedStream.id,
-        userId: currentUser.id,
-        userName: currentUser.name,
-        userAvatar: currentUser.avatar,
-        message: msgContent
-      });
-    } catch (err) {
-      console.log('Send message live stream notice:', err);
+    if (isBackendStreamId(selectedStream.id)) {
+      try {
+        await sendStreamMessage(selectedStream.id, msgContent);
+      } catch (err) {
+        console.error('SignalR çat xətası, REST fallback:', err);
+        try {
+          await apiSendLiveStreamMessage({
+            liveStreamId: selectedStream.id,
+            userId: currentUser.id,
+            userName: currentUser.username,
+            userAvatar: coalesceAvatar(currentUser.avatar),
+            message: msgContent,
+          });
+        } catch (restErr) {
+          console.error('Canlı çat mesajı göndərilə bilmədi:', restErr);
+        }
+      }
     }
   };
 
+  const handleStreamReaction = (reactionType: 'heart' | 'fire' | 'clap') => {
+    if (!selectedStream || !currentUser || !isBackendStreamId(selectedStream.id)) return;
+    const emoji = STREAM_REACTION_EMOJI[reactionType];
+    const newReaction: FloatingReaction = {
+      id: 'reaction_' + Math.random(),
+      emoji,
+      left: Math.random() * 80 + 10,
+    };
+    setFloatingReactions((prev) => [...prev, newReaction]);
+    setTimeout(() => {
+      setFloatingReactions((prev) => prev.filter((r) => r.id !== newReaction.id));
+    }, 3000);
+    sendStreamReaction(selectedStream.id, reactionType).catch((err) => {
+      console.error('Reaksiya göndərilə bilmədi:', err);
+    });
+  };
+
+  if (!currentUser) {
+    return (
+      <EmptyState
+        icon={Radio}
+        title="Daxil olmalısınız"
+        description="Canlı yayımı izləmək üçün hesabınıza daxil olun."
+        theme={theme}
+      />
+    );
+  }
+
+  if (isStreamsLoading) {
+    return (
+      <div className={`p-12 rounded-3xl border flex flex-col items-center justify-center gap-3 ${
+        theme === 'dark' ? 'bg-zinc-900/40 border-zinc-800' : 'bg-white border-zinc-200'
+      }`}>
+        <Loader2 className="w-8 h-8 text-red-500 animate-spin" />
+        <p className="text-sm text-zinc-500">Canlı yayım kanalları yüklənir...</p>
+      </div>
+    );
+  }
+
+  if (streamsList.length === 0 || !selectedStream) {
+    return (
+      <EmptyState
+        icon={Radio}
+        title="Hazırda aktiv canlı yayım yoxdur"
+        description="Admin paneldən kanal canlı edildikdə burada görünəcək."
+        theme={theme}
+        actionLabel="Yenidən yoxla"
+        onAction={() => refetchStreams()}
+      />
+    );
+  }
+
   const currentIcon = selectedStream.typeIcon;
+  const playback = getStreamPlaybackInfo(selectedStream.streamUrl);
 
   return (
     <div className={`space-y-6 max-w-7xl mx-auto p-1 transition-all duration-500 ${isCinemaMode ? 'bg-black p-4 rounded-3xl border border-zinc-900 shadow-2xl relative z-40' : ''}`}>
@@ -367,15 +444,32 @@ export default function LiveStream({
                 </span>
               </div>
 
-              {/* Video Playback IFrame */}
+              {/* Video player — YouTube iframe və ya HLS/MP4 video */}
               {isPlaying ? (
-                <iframe
-                  src={`${selectedStream.streamUrl}?autoplay=1&mute=${isMuted ? 1 : 0}&controls=1`}
-                  title="CineVerse Stream Player"
-                  className="w-full h-full object-cover absolute inset-0 pointer-events-auto"
-                  allow="autoplay; encrypted-media; gyroscope; picture-in-picture"
-                  allowFullScreen
-                />
+                playback.mode === 'iframe' && playback.src ? (
+                  <iframe
+                    src={`${playback.src}?autoplay=1&mute=${isMuted ? 1 : 0}&controls=1`}
+                    title="CineVerse Stream Player"
+                    className="w-full h-full object-cover absolute inset-0 pointer-events-auto"
+                    allow="autoplay; encrypted-media; gyroscope; picture-in-picture"
+                    allowFullScreen
+                  />
+                ) : playback.src ? (
+                  <video
+                    key={playback.src}
+                    src={playback.src}
+                    autoPlay
+                    muted={isMuted}
+                    controls
+                    playsInline
+                    className="w-full h-full object-cover absolute inset-0 pointer-events-auto bg-black"
+                  />
+                ) : (
+                  <div className="absolute inset-0 flex flex-col items-center justify-center text-center p-6 z-10">
+                    <AlertTriangle className="w-10 h-10 text-amber-500 mb-2" />
+                    <p className="text-sm text-zinc-300">Yayım URL-i tapılmadı.</p>
+                  </div>
+                )
               ) : (
                 <div className="absolute inset-0 flex flex-col items-center justify-center text-center p-6 z-10">
                   <img src={selectedStream.banner} alt="Stream banner" className="absolute inset-0 w-full h-full object-cover opacity-20 filter blur-xs" />
@@ -599,13 +693,39 @@ export default function LiveStream({
           </div>
 
           {/* Messages window with smooth scroll-to-bottom */}
-          <div className="flex-1 overflow-y-auto p-4 space-y-3 select-text select-none scrollbar-thin">
-            {chatMessages.map((msg) => {
-              const isMe = msg.sender === currentUser.name;
+          <div className="flex-1 overflow-y-auto p-4 space-y-3 select-text select-none scrollbar-thin relative">
+            {floatingReactions.map((r) => (
+              <span
+                key={r.id}
+                className="absolute bottom-4 text-2xl pointer-events-none animate-bounce"
+                style={{ left: `${r.left}%` }}
+              >
+                {r.emoji}
+              </span>
+            ))}
+            {chatMessages.length === 0 ? (
+              <div className="h-full flex flex-col items-center justify-center text-center py-8 opacity-60">
+                <MessageSquare className="w-8 h-8 text-zinc-600 mb-2" />
+                <p className="text-xs text-zinc-500 font-medium">Hələ mesaj yoxdur</p>
+                <p className="text-[10px] text-zinc-600 mt-1">İlk mesajı siz yazın!</p>
+              </div>
+            ) : chatMessages.map((msg) => {
+              const isMe = isOwnChatMessage(msg, currentUser);
               const canEdit = isMe || currentUser.role === 'admin';
               return (
                 <div key={msg.id} className="flex items-start gap-2.5 animate-fade-in text-xs">
-                  <img src={msg.avatar} alt={msg.sender} className="w-7 h-7 rounded-full object-cover ring-1 ring-white/10 shrink-0 mt-0.5" />
+                  <img
+                    src={resolveChatAvatar(
+                      { senderId: msg.senderId, sender: msg.sender, senderAvatar: msg.avatar },
+                      { currentUser },
+                    )}
+                    alt={msg.sender}
+                    onError={(e) => {
+                      e.currentTarget.onerror = null;
+                      e.currentTarget.src = DEFAULT_CHAT_AVATAR;
+                    }}
+                    className="w-7 h-7 rounded-full object-cover ring-1 ring-white/10 shrink-0 mt-0.5"
+                  />
                   <div className="flex-1 min-w-0">
                     <div className="flex items-baseline gap-1.5">
                       <span className={`font-black font-display tracking-tight hover:underline cursor-pointer truncate max-w-[120px] ${msg.colorClass}`}>
@@ -682,8 +802,30 @@ export default function LiveStream({
             <div ref={chatEndRef} />
           </div>
 
-          {/* Input text field bar */}
-          <form onSubmit={handleSendChat} className="p-3 border-t border-zinc-800/10 bg-zinc-800/5 flex gap-2">
+          {/* Reaction + input bar */}
+          <div className="p-3 border-t border-zinc-800/10 bg-zinc-800/5 space-y-2">
+            <div className="flex items-center gap-2">
+              {([
+                { type: 'heart' as const, emoji: '❤️', label: 'Ürək' },
+                { type: 'fire' as const, emoji: '🔥', label: 'Alov' },
+                { type: 'clap' as const, emoji: '👏', label: 'Alqış' },
+              ]).map((item) => (
+                <button
+                  key={item.type}
+                  type="button"
+                  onClick={() => handleStreamReaction(item.type)}
+                  className={`px-2.5 py-1 rounded-lg text-sm transition cursor-pointer border ${
+                    theme === 'dark'
+                      ? 'bg-zinc-900 border-zinc-800 hover:bg-zinc-800'
+                      : 'bg-white border-zinc-200 hover:bg-zinc-50'
+                  }`}
+                  title={item.label}
+                >
+                  {item.emoji}
+                </button>
+              ))}
+            </div>
+          <form onSubmit={handleSendChat} className="flex gap-2">
             <input
               type="text"
               value={newMessageText}
@@ -702,6 +844,7 @@ export default function LiveStream({
               <Send className="w-4 h-4" />
             </button>
           </form>
+          </div>
         </div>
       </div>
     </div>

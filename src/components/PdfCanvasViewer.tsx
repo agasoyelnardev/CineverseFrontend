@@ -1,10 +1,16 @@
 import React, { useEffect, useRef, useState } from 'react';
-import { ChevronLeft, ChevronRight, ZoomIn, ZoomOut, Download, ExternalLink, RefreshCw, AlertCircle, FileText } from 'lucide-react';
+import { ChevronLeft, ChevronRight, ZoomIn, ZoomOut, ExternalLink, RefreshCw, AlertCircle, FileText } from 'lucide-react';
+import {
+  resolvePdfUrl,
+  isSameOriginPdfUrl,
+  getDirectEmbedUrl,
+} from '../utils/pdfUrl';
 
 interface PdfCanvasViewerProps {
   pdfUrl: string;
   title: string;
   onSwitchToTextMode?: () => void;
+  onRequestGoogleViewer?: () => void;
 }
 
 declare global {
@@ -13,7 +19,12 @@ declare global {
   }
 }
 
-export const PdfCanvasViewer: React.FC<PdfCanvasViewerProps> = ({ pdfUrl, title, onSwitchToTextMode }) => {
+export const PdfCanvasViewer: React.FC<PdfCanvasViewerProps> = ({
+  pdfUrl,
+  title,
+  onSwitchToTextMode,
+  onRequestGoogleViewer,
+}) => {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const [pdfDoc, setPdfDoc] = useState<any>(null);
   const [pageNum, setPageNum] = useState<number>(1);
@@ -22,7 +33,9 @@ export const PdfCanvasViewer: React.FC<PdfCanvasViewerProps> = ({ pdfUrl, title,
   const [loading, setLoading] = useState<boolean>(true);
   const [error, setError] = useState<string | null>(null);
 
-  // Helper to convert base64 data URI to Uint8Array for pdf.js
+  const resolvedUrl = resolvePdfUrl(pdfUrl);
+  const openUrl = getDirectEmbedUrl(pdfUrl);
+
   const dataURItoUint8Array = (dataURI: string): Uint8Array => {
     const base64Index = dataURI.indexOf(';base64,');
     if (base64Index !== -1) {
@@ -38,17 +51,22 @@ export const PdfCanvasViewer: React.FC<PdfCanvasViewerProps> = ({ pdfUrl, title,
     throw new Error('Etibarsız Data URI formatı');
   };
 
-  // Load PDF Document
   useEffect(() => {
     let isMounted = true;
     setLoading(true);
     setError(null);
+    setPdfDoc(null);
+    setPageNum(1);
+    setNumPages(0);
 
     const loadPdf = async () => {
       try {
+        if (!resolvedUrl) {
+          throw new Error('PDF linki tapılmadı.');
+        }
+
         if (!window.pdfjsLib) {
-          // Wait briefly if script is loading
-          await new Promise(resolve => setTimeout(resolve, 500));
+          await new Promise((resolve) => setTimeout(resolve, 500));
         }
 
         if (!window.pdfjsLib) {
@@ -56,11 +74,26 @@ export const PdfCanvasViewer: React.FC<PdfCanvasViewerProps> = ({ pdfUrl, title,
         }
 
         let loadingTask;
-        if (pdfUrl.startsWith('data:')) {
-          const uint8Array = dataURItoUint8Array(pdfUrl);
+        if (resolvedUrl.startsWith('data:')) {
+          const uint8Array = dataURItoUint8Array(resolvedUrl);
           loadingTask = window.pdfjsLib.getDocument({ data: uint8Array });
+        } else if (resolvedUrl.startsWith('blob:')) {
+          loadingTask = window.pdfjsLib.getDocument(resolvedUrl);
+        } else if (isSameOriginPdfUrl(resolvedUrl)) {
+          const fetchUrl = resolvedUrl.startsWith('/')
+            ? resolvedUrl
+            : resolvePdfUrl(resolvedUrl);
+          const response = await fetch(fetchUrl);
+          if (!response.ok) {
+            throw new Error(`PDF yüklənmədi (${response.status})`);
+          }
+          const buffer = await response.arrayBuffer();
+          loadingTask = window.pdfjsLib.getDocument({ data: new Uint8Array(buffer) });
         } else {
-          loadingTask = window.pdfjsLib.getDocument(pdfUrl);
+          loadingTask = window.pdfjsLib.getDocument({
+            url: resolvedUrl,
+            withCredentials: false,
+          });
         }
 
         const pdf = await loadingTask.promise;
@@ -84,36 +117,53 @@ export const PdfCanvasViewer: React.FC<PdfCanvasViewerProps> = ({ pdfUrl, title,
     return () => {
       isMounted = false;
     };
-  }, [pdfUrl]);
+  }, [resolvedUrl]);
 
-  // Render current page to canvas
   useEffect(() => {
     if (!pdfDoc || !canvasRef.current) return;
 
     let isCurrent = true;
+    let renderTask: { cancel?: () => void; promise: Promise<void> } | null = null;
 
     const renderPage = async () => {
       try {
         const page = await pdfDoc.getPage(pageNum);
         if (!isCurrent || !canvasRef.current) return;
 
-        const viewport = page.getViewport({ scale });
         const canvas = canvasRef.current;
-        const context = canvas.getContext('2d');
-
+        const context = canvas.getContext('2d', { alpha: false });
         if (!context) return;
 
-        canvas.height = viewport.height;
-        canvas.width = viewport.width;
+        const outputScale = window.devicePixelRatio || 1;
+        const viewport = page.getViewport({ scale });
+        const pixelWidth = Math.floor(viewport.width * outputScale);
+        const pixelHeight = Math.floor(viewport.height * outputScale);
 
-        const renderContext = {
+        canvas.width = pixelWidth;
+        canvas.height = pixelHeight;
+        canvas.style.width = `${Math.floor(viewport.width)}px`;
+        canvas.style.height = `${Math.floor(viewport.height)}px`;
+
+        context.setTransform(1, 0, 0, 1, 0, 0);
+        context.fillStyle = '#ffffff';
+        context.fillRect(0, 0, pixelWidth, pixelHeight);
+
+        const transform = outputScale !== 1
+          ? [outputScale, 0, 0, outputScale, 0, 0]
+          : undefined;
+
+        renderTask = page.render({
           canvasContext: context,
-          viewport: viewport
-        };
+          viewport,
+          transform,
+          background: 'rgb(255, 255, 255)',
+        });
 
-        await page.render(renderContext).promise;
-      } catch (err) {
-        console.error('Page render error:', err);
+        await renderTask.promise;
+      } catch (err: any) {
+        if (err?.name !== 'RenderingCancelledException') {
+          console.error('Page render error:', err);
+        }
       }
     };
 
@@ -121,46 +171,45 @@ export const PdfCanvasViewer: React.FC<PdfCanvasViewerProps> = ({ pdfUrl, title,
 
     return () => {
       isCurrent = false;
+      renderTask?.cancel?.();
     };
   }, [pdfDoc, pageNum, scale]);
 
   const handleOpenNewTab = () => {
-    if (pdfUrl.startsWith('data:')) {
+    if (resolvedUrl.startsWith('data:')) {
       try {
-        const uint8Array = dataURItoUint8Array(pdfUrl);
+        const uint8Array = dataURItoUint8Array(resolvedUrl);
         const blob = new Blob([uint8Array], { type: 'application/pdf' });
         const blobUrl = URL.createObjectURL(blob);
         window.open(blobUrl, '_blank');
-      } catch (e) {
-        window.open(pdfUrl, '_blank');
+      } catch {
+        window.open(resolvedUrl, '_blank');
       }
-    } else {
-      window.open(pdfUrl, '_blank');
+      return;
     }
+    window.open(openUrl, '_blank');
   };
 
   return (
     <div className="w-full max-w-5xl flex flex-col items-center gap-3">
-      {/* TOOLBAR CONTROLS */}
       <div className="w-full flex flex-wrap items-center justify-between gap-2 p-3 rounded-2xl bg-zinc-900 border border-zinc-800 text-xs shadow-lg">
-        {/* Page navigation */}
         <div className="flex items-center gap-2">
           <button
             disabled={pageNum <= 1 || loading}
-            onClick={() => setPageNum(prev => Math.max(1, prev - 1))}
+            onClick={() => setPageNum((prev) => Math.max(1, prev - 1))}
             className="p-1.5 rounded-lg bg-zinc-800 hover:bg-zinc-700 disabled:opacity-40 transition cursor-pointer text-white font-bold"
             title="Əvvəlki səhifə"
           >
             <ChevronLeft className="w-4 h-4" />
           </button>
-          
+
           <span className="text-zinc-300 font-mono text-xs font-bold px-2">
             Səhifə <span className="text-red-400">{pageNum}</span> / {numPages || '...'}
           </span>
 
           <button
             disabled={pageNum >= numPages || loading}
-            onClick={() => setPageNum(prev => Math.min(numPages, prev + 1))}
+            onClick={() => setPageNum((prev) => Math.min(numPages, prev + 1))}
             className="p-1.5 rounded-lg bg-zinc-800 hover:bg-zinc-700 disabled:opacity-40 transition cursor-pointer text-white font-bold"
             title="Növbəti səhifə"
           >
@@ -168,10 +217,9 @@ export const PdfCanvasViewer: React.FC<PdfCanvasViewerProps> = ({ pdfUrl, title,
           </button>
         </div>
 
-        {/* Zoom controls */}
         <div className="flex items-center gap-2">
           <button
-            onClick={() => setScale(prev => Math.max(0.6, prev - 0.2))}
+            onClick={() => setScale((prev) => Math.max(0.6, prev - 0.2))}
             className="p-1.5 rounded-lg bg-zinc-800 hover:bg-zinc-700 transition cursor-pointer text-white"
             title="Kiçilt"
           >
@@ -181,7 +229,7 @@ export const PdfCanvasViewer: React.FC<PdfCanvasViewerProps> = ({ pdfUrl, title,
             {Math.round(scale * 100)}%
           </span>
           <button
-            onClick={() => setScale(prev => Math.min(2.5, prev + 0.2))}
+            onClick={() => setScale((prev) => Math.min(2.5, prev + 0.2))}
             className="p-1.5 rounded-lg bg-zinc-800 hover:bg-zinc-700 transition cursor-pointer text-white"
             title="Böyüt"
           >
@@ -189,7 +237,6 @@ export const PdfCanvasViewer: React.FC<PdfCanvasViewerProps> = ({ pdfUrl, title,
           </button>
         </div>
 
-        {/* Mode & Action buttons */}
         <div className="flex items-center gap-2">
           {onSwitchToTextMode && (
             <button
@@ -209,26 +256,33 @@ export const PdfCanvasViewer: React.FC<PdfCanvasViewerProps> = ({ pdfUrl, title,
         </div>
       </div>
 
-      {/* CANVAS DISPLAY CONTAINER */}
-      <div className="w-full h-[75vh] min-h-[550px] rounded-3xl border border-zinc-800/80 bg-zinc-950 overflow-auto p-4 flex items-start justify-center shadow-2xl relative custom-scrollbar">
+      <div className="w-full h-[75vh] min-h-[550px] rounded-3xl border border-zinc-300/40 bg-zinc-200 overflow-auto p-6 flex items-start justify-center shadow-2xl relative custom-scrollbar">
         {loading && (
-          <div className="absolute inset-0 flex flex-col items-center justify-center bg-zinc-950/90 text-white gap-3 z-20">
+          <div className="absolute inset-0 flex flex-col items-center justify-center bg-zinc-200/95 text-zinc-800 gap-3 z-20">
             <RefreshCw className="w-8 h-8 text-red-500 animate-spin" />
             <span className="text-xs font-bold tracking-wider">PDF SƏNƏDİ HAZIRLANIR...</span>
           </div>
         )}
 
         {error ? (
-          <div className="flex flex-col items-center justify-center text-center p-8 text-zinc-400 gap-3 my-auto">
+          <div className="flex flex-col items-center justify-center text-center p-8 text-zinc-600 gap-3 my-auto">
             <AlertCircle className="w-12 h-12 text-red-500" />
-            <h4 className="font-bold text-white text-sm">PDF Nümayiş Etdirilə Bilmədi</h4>
-            <p className="text-xs max-w-md text-zinc-400">
-              Bu fayl xarici qorunmaya malik ola bilər və ya format dəstəklənmir. Siz sənədi xarici pəncərədə aça və ya interaktiv mətn rejimindən istifadə edə bilərsiniz.
+            <h4 className="font-bold text-zinc-900 text-sm">PDF Nümayiş Etdirilə Bilmədi</h4>
+            <p className="text-xs max-w-md text-zinc-600">
+              Bu fayl xarici qorunmaya malik ola bilər və ya format dəstəklənmir. Google Viewer, xarici pəncərə və ya mətn rejimindən istifadə edin.
             </p>
-            <div className="flex gap-3 mt-2">
+            <div className="flex flex-wrap gap-3 mt-2 justify-center">
+              {onRequestGoogleViewer && (
+                <button
+                  onClick={onRequestGoogleViewer}
+                  className="px-4 py-2 bg-red-600 hover:bg-red-500 text-white font-bold text-xs rounded-xl"
+                >
+                  Google Viewer ilə Aç
+                </button>
+              )}
               <button
                 onClick={handleOpenNewTab}
-                className="px-4 py-2 bg-red-600 hover:bg-red-500 text-white font-bold text-xs rounded-xl"
+                className="px-4 py-2 bg-zinc-800 hover:bg-zinc-700 text-white font-bold text-xs rounded-xl"
               >
                 Faylı Yeni Tabda Aç
               </button>
@@ -243,10 +297,13 @@ export const PdfCanvasViewer: React.FC<PdfCanvasViewerProps> = ({ pdfUrl, title,
             </div>
           </div>
         ) : (
-          <canvas
-            ref={canvasRef}
-            className="shadow-2xl rounded-xl border border-zinc-800 max-w-full bg-white my-2"
-          />
+          <div className="bg-white rounded-xl shadow-2xl border border-zinc-200 p-1 my-2">
+            <canvas
+              ref={canvasRef}
+              className="block max-w-full rounded-lg"
+              aria-label={title}
+            />
+          </div>
         )}
       </div>
     </div>

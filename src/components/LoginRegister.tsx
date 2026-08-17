@@ -1,12 +1,39 @@
-import React, { useState } from 'react';
-import { Mail, Lock, User as UserIcon, Film, Play } from 'lucide-react';
+import React, { useState, useEffect, useRef, useCallback } from 'react';
+import { Mail, Lock, User as UserIcon } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
 import { User } from '../types';
-import { MOCK_USERS } from '../data';
+import { apiLogin, apiRegister, apiExternalLogin, apiGetMe, apiGetUserProfile } from '../api';
+import { extractIdList } from '../utils/entityIds';
+import { getHighestBadgeForPoints } from './GamificationBadges';
 
 interface LoginRegisterProps {
   onLoginSuccess: (user: User) => void;
 }
+
+const GOOGLE_GSI_SCRIPT_ID = 'google-gsi-client';
+const FACEBOOK_SDK_SCRIPT_ID = 'facebook-jssdk';
+const googleClientId = import.meta.env.VITE_GOOGLE_CLIENT_ID?.trim() || '';
+const facebookAppId = import.meta.env.VITE_FACEBOOK_APP_ID?.trim() || '';
+
+const PLACEHOLDER_APP_IDS = new Set([
+  'your_app_id',
+  'your-app-id',
+  'your_facebook_app_id',
+  'your-facebook-app-id',
+  'placeholder',
+  'changeme',
+  'xxx',
+]);
+
+function isPlaceholderAppId(value: string): boolean {
+  const normalized = value.trim().toLowerCase();
+  if (!normalized) return true;
+  if (PLACEHOLDER_APP_IDS.has(normalized)) return true;
+  return normalized.startsWith('your_') || normalized.startsWith('your-');
+}
+
+const isGoogleConfigured = googleClientId.length > 0;
+const isFacebookConfigured = facebookAppId.length > 0 && !isPlaceholderAppId(facebookAppId);
 
 export default function LoginRegister({ onLoginSuccess }: LoginRegisterProps) {
   const [isLogin, setIsLogin] = useState(true);
@@ -15,8 +42,43 @@ export default function LoginRegister({ onLoginSuccess }: LoginRegisterProps) {
   const [username, setUsername] = useState('');
   const [fullName, setFullName] = useState('');
   const [error, setError] = useState('');
+  const [isSubmitting, setIsSubmitting] = useState(false);
+  const [isGoogleReady, setIsGoogleReady] = useState(false);
+  const [isFacebookReady, setIsFacebookReady] = useState(false);
+  const googleButtonRef = useRef<HTMLDivElement>(null);
+  const googleCallbackRef = useRef<(response: GoogleCredentialResponse) => void>(() => {});
 
-  const handleLogin = (e: React.FormEvent) => {
+  // Backend-dən gələn profil məlumatını frontend User tipinə map edir.
+  const mapToUser = (profile: any, fullProfile?: any): User => {
+    const rawRole = profile.Role || profile.role || (Array.isArray(profile.roles) ? profile.roles[0] : '');
+    const isAdmin = 
+      (typeof rawRole === 'string' && rawRole.toLowerCase() === 'admin') ||
+      (Array.isArray(profile.roles) && profile.roles.some((r: any) => typeof r === 'string' && r.toLowerCase() === 'admin')) ||
+      profile.email?.toLowerCase() === 'admin@gmail.com';
+
+    return {
+      id: profile.id,
+      username: profile.userName ?? profile.username ?? '',
+      name: profile.fullName ?? profile.name ?? profile.userName ?? '',
+      email: profile.email ?? '',
+      avatar: fullProfile?.avatar || profile.avatar || 'https://images.unsplash.com/photo-1535713875002-d1d0cf377fde?w=150&auto=format&fit=crop&q=80',
+      bio: fullProfile?.bio ?? profile.bio ?? '',
+      followersCount: fullProfile?.followersCount ?? profile.followersCount ?? 0,
+      followingCount: fullProfile?.followingCount ?? profile.followingCount ?? 0,
+      points: fullProfile?.points ?? 0,
+      badge: getHighestBadgeForPoints(fullProfile?.points ?? 0).name,
+      isPremium: fullProfile?.isPremium ?? false,
+      role: isAdmin ? 'admin' : 'user',
+      favorites: extractIdList(profile, 'favoriteMovieIds', 'FavoriteMovieIds'),
+      watchlist: extractIdList(profile, 'watchlistMovieIds', 'WatchlistMovieIds'),
+      favoriteBooks: extractIdList(profile, 'favoriteBookIds', 'FavoriteBookIds'),
+      savedCollections: [],
+      followers: [],
+      following: []
+    };
+  };
+
+  const handleLogin = async (e: React.FormEvent) => {
     e.preventDefault();
     setError('');
 
@@ -25,43 +87,25 @@ export default function LoginRegister({ onLoginSuccess }: LoginRegisterProps) {
       return;
     }
 
-    const isEmailAdmin = email.toLowerCase().startsWith('admin@');
-
-    // Check mock users
-    const user = MOCK_USERS.find(
-      (u) => u.email.toLowerCase() === email.toLowerCase()
-    );
-
-    if (user) {
-      onLoginSuccess({
-        ...user,
-        role: isEmailAdmin ? 'admin' : user.role
-      });
-    } else {
-      // Create a temporary user if not found but is user-typed
-      const newMockUser: User = {
-        id: 'u_new_' + Date.now(),
-        username: email.split('@')[0],
-        name: email.split('@')[0].toUpperCase(),
-        email: email,
-        avatar: isEmailAdmin
-          ? 'https://images.unsplash.com/photo-1534528741775-53994a69daeb?w=150&auto=format&fit=crop&q=80'
-          : 'https://images.unsplash.com/photo-1535713875002-d1d0cf377fde?w=150&auto=format&fit=crop&q=80',
-        bio: isEmailAdmin ? 'CineVerse Administratoru.' : 'Yeni CineVerse istifadəçisi.',
-        followersCount: isEmailAdmin ? 100 : 0,
-        followingCount: isEmailAdmin ? 50 : 0,
-        role: isEmailAdmin ? 'admin' : 'user',
-        favorites: [],
-        watchlist: [],
-        savedCollections: [],
-        followers: [],
-        following: []
-      };
-      onLoginSuccess(newMockUser);
+    setIsSubmitting(true);
+    try {
+      await apiLogin(email, password);
+      const profile = await apiGetMe();
+      let fullProfile = null;
+      try {
+        fullProfile = await apiGetUserProfile(profile.id);
+      } catch {
+        // minimal profil ilə davam et
+      }
+      onLoginSuccess(mapToUser(profile, fullProfile));
+    } catch (err: any) {
+      setError(err.message || 'Giriş zamanı xəta baş verdi.');
+    } finally {
+      setIsSubmitting(false);
     }
   };
 
-  const handleRegister = (e: React.FormEvent) => {
+  const handleRegister = async (e: React.FormEvent) => {
     e.preventDefault();
     setError('');
 
@@ -70,149 +114,281 @@ export default function LoginRegister({ onLoginSuccess }: LoginRegisterProps) {
       return;
     }
 
-    const isEmailAdmin = email.toLowerCase().startsWith('admin@');
+    setIsSubmitting(true);
+    try {
+      await apiRegister({ email, passwordHash: password, username, fullName });
+      const profile = await apiGetMe();
+      let fullProfile = null;
+      try {
+        fullProfile = await apiGetUserProfile(profile.id);
+      } catch {
+        // minimal profil ilə davam et
+      }
+      onLoginSuccess(mapToUser(profile, fullProfile));
+    } catch (err: any) {
+      setError(err.message || 'Qeydiyyat zamanı xəta baş verdi.');
+    } finally {
+      setIsSubmitting(false);
+    }
+  };
 
-    const newUser: User = {
-      id: 'u_' + Date.now(),
-      username: username,
-      name: fullName,
-      email: email,
-      avatar: isEmailAdmin
-        ? 'https://images.unsplash.com/photo-1534528741775-53994a69daeb?w=150&auto=format&fit=crop&q=80'
-        : 'https://images.unsplash.com/photo-1535713875002-d1d0cf377fde?w=150&auto=format&fit=crop&q=80',
-      bio: isEmailAdmin ? 'CineVerse Administratoru.' : 'Yeni CineVerse istifadəçisi.',
-      followersCount: 0,
-      followingCount: 0,
-      role: isEmailAdmin ? 'admin' : 'user',
-      favorites: [],
-      watchlist: [],
-      savedCollections: [],
-      followers: [],
-      following: []
+  const completeSocialLogin = useCallback(async () => {
+    const profile = await apiGetMe();
+    let fullProfile = null;
+    try {
+      fullProfile = await apiGetUserProfile(profile.id);
+    } catch {
+      // minimal profil ilə davam et
+    }
+    onLoginSuccess(mapToUser(profile, fullProfile));
+  }, [onLoginSuccess]);
+
+  const handleGoogleCredentialResponse = useCallback(async (response: GoogleCredentialResponse) => {
+    if (!response.credential) {
+      setError('Google ID Token alına bilmədi.');
+      return;
+    }
+
+    setError('');
+    setIsSubmitting(true);
+    try {
+      await apiExternalLogin({
+        provider: 'google',
+        idToken: response.credential,
+      });
+      await completeSocialLogin();
+    } catch (err: any) {
+      setError(err.message || 'Google girişi zamanı xəta baş verdi.');
+    } finally {
+      setIsSubmitting(false);
+    }
+  }, [completeSocialLogin]);
+
+  useEffect(() => {
+    googleCallbackRef.current = (response) => {
+      void handleGoogleCredentialResponse(response);
+    };
+  }, [handleGoogleCredentialResponse]);
+
+  useEffect(() => {
+    if (!isGoogleConfigured) return;
+
+    const initializeGoogleIdentity = () => {
+      if (!window.google?.accounts?.id) return;
+      window.google.accounts.id.initialize({
+        client_id: googleClientId,
+        callback: (response) => googleCallbackRef.current(response),
+        auto_select: false,
+        cancel_on_tap_outside: true,
+      });
+      setIsGoogleReady(true);
     };
 
-    onLoginSuccess(newUser);
-  };
+    if (window.google?.accounts?.id) {
+      initializeGoogleIdentity();
+      return;
+    }
+
+    const existingScript = document.getElementById(GOOGLE_GSI_SCRIPT_ID) as HTMLScriptElement | null;
+    if (existingScript) {
+      existingScript.addEventListener('load', initializeGoogleIdentity);
+      return () => existingScript.removeEventListener('load', initializeGoogleIdentity);
+    }
+
+    const script = document.createElement('script');
+    script.id = GOOGLE_GSI_SCRIPT_ID;
+    script.src = 'https://accounts.google.com/gsi/client';
+    script.async = true;
+    script.defer = true;
+    script.onload = initializeGoogleIdentity;
+    document.head.appendChild(script);
+
+    return () => {
+      script.onload = null;
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!isGoogleReady || !isGoogleConfigured || !googleButtonRef.current) return;
+
+    googleButtonRef.current.innerHTML = '';
+    window.google?.accounts.id.renderButton(googleButtonRef.current, {
+      type: 'standard',
+      theme: 'outline',
+      size: 'large',
+      text: 'signin_with',
+      width: Math.max(googleButtonRef.current.offsetWidth, 120),
+    });
+  }, [isGoogleReady]);
+
+  const handleFacebookLoginResponse = useCallback(async (response: FacebookLoginResponse) => {
+    const accessToken = response.authResponse?.accessToken;
+    if (!accessToken) {
+      if (response.status !== 'unknown') {
+        setError('Facebook giriş ləğv edildi.');
+      }
+      return;
+    }
+
+    setError('');
+    setIsSubmitting(true);
+    try {
+      await apiExternalLogin({
+        provider: 'facebook',
+        idToken: accessToken,
+      });
+      await completeSocialLogin();
+    } catch (err: any) {
+      setError(err.message || 'Facebook girişi zamanı xəta baş verdi.');
+    } finally {
+      setIsSubmitting(false);
+    }
+  }, [completeSocialLogin]);
+
+  useEffect(() => {
+    if (!isFacebookConfigured) return;
+
+    const initializeFacebook = () => {
+      if (!window.FB) return;
+      window.FB.init({
+        appId: facebookAppId,
+        cookie: true,
+        xfbml: false,
+        version: 'v22.0',
+      });
+      setIsFacebookReady(true);
+    };
+
+    if (window.FB) {
+      initializeFacebook();
+      return;
+    }
+
+    const previousFbAsyncInit = window.fbAsyncInit;
+    window.fbAsyncInit = () => {
+      previousFbAsyncInit?.();
+      initializeFacebook();
+    };
+
+    if (document.getElementById(FACEBOOK_SDK_SCRIPT_ID)) return;
+
+    const script = document.createElement('script');
+    script.id = FACEBOOK_SDK_SCRIPT_ID;
+    script.src = 'https://connect.facebook.net/en_US/sdk.js';
+    script.async = true;
+    script.defer = true;
+    script.crossOrigin = 'anonymous';
+    document.body.appendChild(script);
+  }, []);
 
   const handleGoogleLogin = () => {
-    const googleUser: User = {
-      id: 'u_google_' + Date.now(),
-      username: 'elnar_google',
-      name: 'Elnar Ağasoy (Google)',
-      email: 'elnar.google@gmail.com',
-      avatar: 'https://images.unsplash.com/photo-1535713875002-d1d0cf377fde?w=150&auto=format&fit=crop&q=80',
-      bio: 'Google ilə daxil olmuş CineVerse istifadəçisi.',
-      followersCount: 15,
-      followingCount: 20,
-      role: 'user',
-      favorites: [],
-      watchlist: [],
-      savedCollections: [],
-      followers: [],
-      following: []
-    };
-    onLoginSuccess(googleUser);
-  };
+    if (!isGoogleConfigured) {
+      setError('Google girişi konfiqurasiya edilməyib (VITE_GOOGLE_CLIENT_ID).');
+      return;
+    }
+    if (!isGoogleReady || !window.google?.accounts?.id) {
+      setError('Google giriş SDK-sı hələ yüklənir. Bir neçə saniyə sonra yenidən cəhd edin.');
+      return;
+    }
 
-  const handleAppleLogin = () => {
-    const appleUser: User = {
-      id: 'u_apple_' + Date.now(),
-      username: 'elnar_apple',
-      name: 'Elnar Ağasoy (Apple)',
-      email: 'elnar.apple@icloud.com',
-      avatar: 'https://images.unsplash.com/photo-1570295999919-56ceb5ecca61?w=150&auto=format&fit=crop&q=80',
-      bio: 'Apple ilə daxil olmuş CineVerse istifadəçisi.',
-      followersCount: 8,
-      followingCount: 12,
-      role: 'user',
-      favorites: [],
-      watchlist: [],
-      savedCollections: [],
-      followers: [],
-      following: []
-    };
-    onLoginSuccess(appleUser);
+    setError('');
+    window.google.accounts.id.prompt((notification) => {
+      if (notification.isNotDisplayed()) {
+        const hiddenButton = googleButtonRef.current?.querySelector('div[role="button"]') as HTMLElement | null;
+        hiddenButton?.click();
+        if (!hiddenButton) {
+          setError(`Google giriş pəncərəsi açıla bilmədi: ${notification.getNotDisplayedReason()}`);
+        }
+      } else if (notification.isSkippedMoment()) {
+        setError('Google giriş ləğv edildi.');
+      }
+    });
   };
 
   const handleFacebookLogin = () => {
-    const facebookUser: User = {
-      id: 'u_facebook_' + Date.now(),
-      username: 'elnar_facebook',
-      name: 'Elnar Ağasoy (Facebook)',
-      email: 'elnar.facebook@gmail.com',
-      avatar: 'https://images.unsplash.com/photo-1507003211169-0a1dd7228f2d?w=150&auto=format&fit=crop&q=80',
-      bio: 'Facebook ilə daxil olmuş CineVerse istifadəçisi.',
-      followersCount: 12,
-      followingCount: 18,
-      role: 'user',
-      favorites: [],
-      watchlist: [],
-      savedCollections: [],
-      followers: [],
-      following: []
-    };
-    onLoginSuccess(facebookUser);
+    if (!isFacebookConfigured) {
+      setError('Facebook girişi konfiqurasiya edilməyib (VITE_FACEBOOK_APP_ID).');
+      return;
+    }
+    if (!isFacebookReady || !window.FB) {
+      setError('Facebook giriş SDK-sı hələ yüklənir. Bir neçə saniyə sonra yenidən cəhd edin.');
+      return;
+    }
+
+    setError('');
+    window.FB.login(
+      (response) => {
+        void handleFacebookLoginResponse(response);
+      },
+      { scope: 'email,public_profile' }
+    );
   };
 
-  const renderSocialLogins = () => (
-    <>
-      <div className="relative my-4">
-        <div className="absolute inset-0 flex items-center">
-          <div className="w-full border-t border-white/5"></div>
+  const renderSocialLogins = () => {
+    if (!isGoogleConfigured && !isFacebookConfigured) {
+      return null;
+    }
+
+    const gridCols = isGoogleConfigured && isFacebookConfigured ? 'grid-cols-2' : 'grid-cols-1';
+
+    return (
+      <>
+        <div className="relative my-4">
+          <div className="absolute inset-0 flex items-center">
+            <div className="w-full border-t border-white/5"></div>
+          </div>
+          <div className="relative flex justify-center text-[10px] uppercase font-bold tracking-wider">
+            <span className="bg-[#0b0b0e] px-3.5 text-zinc-500">və ya</span>
+          </div>
         </div>
-        <div className="relative flex justify-center text-[10px] uppercase font-bold tracking-wider">
-          <span className="bg-[#0b0b0e] px-3.5 text-zinc-500">və ya</span>
+
+        <div className={`grid ${gridCols} gap-2`}>
+          {isGoogleConfigured && (
+            <button
+              type="button"
+              onClick={handleGoogleLogin}
+              disabled={isSubmitting}
+              className="relative flex items-center justify-center gap-1.5 py-2.5 px-2 bg-white/5 hover:bg-white/10 border border-white/5 rounded-xl text-[10px] font-semibold text-white transition duration-300 cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed overflow-hidden"
+            >
+              <svg className="w-3.5 h-3.5 pointer-events-none" viewBox="0 0 24 24">
+                <path
+                  fill="#EA4335"
+                  d="M12.24 10.285V14.4h6.887c-.275 1.565-1.88 4.604-6.887 4.604-4.33 0-7.859-3.579-7.859-8s3.529-8 7.859-8c2.46 0 4.105 1.025 5.047 1.926l3.258-3.133C18.332 1.154 15.447 0 12.24 0 5.58 0 0 5.37 0 12s5.58 12 12.24 12c6.96 0 11.57-4.83 11.57-11.79 0-.79-.085-1.4-.189-1.925H12.24z"
+                />
+              </svg>
+              <span className="font-mono pointer-events-none">Google</span>
+              <div
+                ref={googleButtonRef}
+                className={`absolute inset-0 opacity-0 ${isSubmitting ? 'pointer-events-none' : ''}`}
+                aria-hidden="true"
+              />
+            </button>
+          )}
+
+          {isFacebookConfigured && (
+            <button
+              type="button"
+              onClick={handleFacebookLogin}
+              disabled={isSubmitting}
+              className="flex items-center justify-center gap-1.5 py-2.5 px-2 bg-white/5 hover:bg-white/10 border border-white/5 rounded-xl text-[10px] font-semibold text-white transition duration-300 cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed"
+            >
+              <svg className="w-3.5 h-3.5 text-[#1877F2]" viewBox="0 0 24 24" fill="currentColor">
+                <path d="M24 12.073c0-6.627-5.373-12-12-12s-12 5.373-12 12c0 5.99 4.388 10.954 10.125 11.854v-8.385H7.078v-3.47h3.047V9.43c0-3.007 1.792-4.669 4.533-4.669 1.312 0 2.686.235 2.686.235v2.953H15.83c-1.491 0-1.956.925-1.956 1.874v2.25h3.328l-.532 3.47h-2.796v8.385C19.612 23.027 24 18.062 24 12.073z"/>
+              </svg>
+              <span className="font-mono">FB</span>
+            </button>
+          )}
         </div>
-      </div>
-
-      <div className="grid grid-cols-3 gap-2">
-        <button
-          type="button"
-          onClick={handleGoogleLogin}
-          className="flex items-center justify-center gap-1.5 py-2.5 px-2 bg-white/5 hover:bg-white/10 border border-white/5 rounded-xl text-[10px] font-semibold text-white transition duration-300 cursor-pointer"
-        >
-          <svg className="w-3.5 h-3.5" viewBox="0 0 24 24">
-            <path
-              fill="#EA4335"
-              d="M12.24 10.285V14.4h6.887c-.275 1.565-1.88 4.604-6.887 4.604-4.33 0-7.859-3.579-7.859-8s3.529-8 7.859-8c2.46 0 4.105 1.025 5.047 1.926l3.258-3.133C18.332 1.154 15.447 0 12.24 0 5.58 0 0 5.37 0 12s5.58 12 12.24 12c6.96 0 11.57-4.83 11.57-11.79 0-.79-.085-1.4-.189-1.925H12.24z"
-            />
-          </svg>
-          <span className="font-mono">Google</span>
-        </button>
-
-        <button
-          type="button"
-          onClick={handleAppleLogin}
-          className="flex items-center justify-center gap-1.5 py-2.5 px-2 bg-white/5 hover:bg-white/10 border border-white/5 rounded-xl text-[10px] font-semibold text-white transition duration-300 cursor-pointer"
-        >
-          <svg className="w-3.5 h-3.5" viewBox="0 0 24 24" fill="currentColor">
-            <path d="M18.71 19.5c-.83 1.24-1.71 2.45-3.05 2.47-1.34.03-1.77-.79-3.29-.79-1.53 0-2 .77-3.27.82-1.31.05-2.3-1.32-3.14-2.53C4.25 17 2.94 12.45 4.7 9.39c.87-1.52 2.43-2.48 4.12-2.51 1.28-.02 2.5.87 3.29.87.78 0 2.26-1.07 3.81-.91.65.03 2.47.26 3.64 1.98-.09.06-2.17 1.28-2.15 3.81.03 3.02 2.65 4.03 2.68 4.04-.03.07-.42 1.44-1.38 2.83M15.97 4.17c.66-.81 1.11-1.93.99-3.06-.96.04-2.13.64-2.82 1.45-.6.7-1.13 1.84-.99 2.94.12-.03.57.11 1.05.11.89 0 2.11-.63 2.77-1.44z" />
-          </svg>
-          <span className="font-mono">Apple</span>
-        </button>
-
-        <button
-          type="button"
-          onClick={handleFacebookLogin}
-          className="flex items-center justify-center gap-1.5 py-2.5 px-2 bg-white/5 hover:bg-white/10 border border-white/5 rounded-xl text-[10px] font-semibold text-white transition duration-300 cursor-pointer"
-        >
-          <svg className="w-3.5 h-3.5 text-[#1877F2]" viewBox="0 0 24 24" fill="currentColor">
-            <path d="M24 12.073c0-6.627-5.373-12-12-12s-12 5.373-12 12c0 5.99 4.388 10.954 10.125 11.854v-8.385H7.078v-3.47h3.047V9.43c0-3.007 1.792-4.669 4.533-4.669 1.312 0 2.686.235 2.686.235v2.953H15.83c-1.491 0-1.956.925-1.956 1.874v2.25h3.328l-.532 3.47h-2.796v8.385C19.612 23.027 24 18.062 24 12.073z"/>
-          </svg>
-          <span className="font-mono">FB</span>
-        </button>
-      </div>
-    </>
-  );
+      </>
+    );
+  };
 
   return (
     <div className="min-h-screen flex items-center justify-center bg-[#08080a] p-4 relative overflow-hidden">
-      {/* Background Cinematic Orbs */}
       <div className="absolute top-1/4 left-1/4 w-96 h-96 bg-red-600/5 rounded-full blur-3xl pointer-events-none"></div>
       <div className="absolute bottom-1/4 right-1/4 w-96 h-96 bg-rose-600/5 rounded-full blur-3xl pointer-events-none"></div>
 
       <div className="w-full max-w-md" id="auth-card">
-        {/* Logo and Header */}
         <div className="text-center mb-8 flex flex-col items-center">
           <div className="flex items-center gap-2 mb-2">
             <span className="text-3xl font-black tracking-tighter text-red-600 font-display">
@@ -224,9 +400,6 @@ export default function LoginRegister({ onLoginSuccess }: LoginRegisterProps) {
           </p>
         </div>
 
-
-
-        {/* Main Card */}
         <div className="bg-white/[0.02] border border-white/5 rounded-2xl p-8 shadow-2xl backdrop-blur-xl relative">
           <div className="flex justify-center gap-8 mb-6 border-b border-white/5 pb-4">
             <button
@@ -305,9 +478,10 @@ export default function LoginRegister({ onLoginSuccess }: LoginRegisterProps) {
                 <button
                   type="submit"
                   id="btn-login"
-                  className="w-full bg-red-600 hover:bg-red-700 text-white font-bold py-2.5 px-4 rounded-xl text-xs transition duration-300 tracking-wider uppercase cursor-pointer"
+                  disabled={isSubmitting}
+                  className="w-full bg-red-600 hover:bg-red-700 text-white font-bold py-2.5 px-4 rounded-xl text-xs transition duration-300 tracking-wider uppercase cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed"
                 >
-                  Giriş et
+                  {isSubmitting ? 'Giriş edilir...' : 'Giriş et'}
                 </button>
 
                 {renderSocialLogins()}
@@ -393,9 +567,10 @@ export default function LoginRegister({ onLoginSuccess }: LoginRegisterProps) {
                 <button
                   type="submit"
                   id="btn-register"
-                  className="w-full bg-red-600 hover:bg-red-700 text-white font-bold py-2.5 px-4 rounded-xl text-xs transition duration-300 tracking-wider uppercase cursor-pointer"
+                  disabled={isSubmitting}
+                  className="w-full bg-red-600 hover:bg-red-700 text-white font-bold py-2.5 px-4 rounded-xl text-xs transition duration-300 tracking-wider uppercase cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed"
                 >
-                  Qeydiyyatdan Keç
+                  {isSubmitting ? 'Qeydiyyat aparılır...' : 'Qeydiyyatdan Keç'}
                 </button>
 
                 {renderSocialLogins()}

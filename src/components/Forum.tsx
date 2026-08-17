@@ -6,6 +6,7 @@ import {
 } from 'lucide-react';
 import { Discussion, Comment, User } from '../types';
 import { 
+  apiGetDiscussionById,
   apiToggleDiscussionLike, 
   apiAddDiscussionComment, 
   apiDeleteDiscussionComment, 
@@ -13,6 +14,16 @@ import {
   apiDeleteDiscussion, 
   apiUpdateDiscussion 
 } from '../api';
+import { useDiscussionsQuery, useCreateDiscussionMutation } from '../hooks/useApiQueries';
+
+// Avatar boş/undefined olanda istifadəçinin ilk hərfindən ibarət default avatar generasiya edir
+function getAvatarUrl(avatarUrl: string | undefined | null, username: string): string {
+  if (avatarUrl && avatarUrl.trim() !== '') {
+    return avatarUrl;
+  }
+  const initial = (username || '?').charAt(0).toUpperCase();
+  return `https://ui-avatars.com/api/?name=${encodeURIComponent(initial)}&background=dc2626&color=fff&bold=true&size=128`;
+}
 
 interface AudioCommentPlayerProps {
   durationSeconds: number;
@@ -104,6 +115,66 @@ interface ForumProps {
 
 type ForumCategory = 'Hamsı' | 'Rəylər' | 'Tövsiyələr' | 'Yeni Filmlər' | 'Nəzəriyyələr';
 
+// Backend enum: Reyler=0, Tovsiyeler=1, YeniFilmler=2, Nezeriyyeler=3
+// UI-da Azəri diakritikalı mətnlər göstərilir, backend-ə göndərəndə isə HƏMİŞƏ rəqəm göndərilir
+// (System.Text.Json enum-u rəqəmlə də, diakritikasız adla da qəbul edir, amma diakritikalı Azəri mətni QƏBUL ETMİR).
+const CATEGORY_TO_ENUM_INDEX: Record<Exclude<ForumCategory, 'Hamsı'>, number> = {
+  'Rəylər': 0,
+  'Tövsiyələr': 1,
+  'Yeni Filmlər': 2,
+  'Nəzəriyyələr': 3,
+};
+
+function backendCategoryToAzeri(raw: unknown): Exclude<ForumCategory, 'Hamsı'> {
+  const key = String(raw).trim().toLowerCase();
+  const byNumber: Record<string, Exclude<ForumCategory, 'Hamsı'>> = {
+    '0': 'Rəylər', '1': 'Tövsiyələr', '2': 'Yeni Filmlər', '3': 'Nəzəriyyələr',
+  };
+  const byName: Record<string, Exclude<ForumCategory, 'Hamsı'>> = {
+    'reyler': 'Rəylər', 'tovsiyeler': 'Tövsiyələr', 'yenifilmler': 'Yeni Filmlər', 'nezeriyyeler': 'Nəzəriyyələr',
+  };
+  return byNumber[key] || byName[key] || 'Rəylər';
+}
+
+// Backend DiscussionDto (siyahı) -> UI-nin gözlədiyi Discussion formatına çevirir.
+// Qeyd: siyahı endpoint-i (GET /discussions) yalnız "commentsCount" qaytarır, tam şərh massivini yox —
+// ona görə "comments" burada yalnız UZUNLUĞU düzgün olan boş yer tutucu massivdir.
+// Müzakirə açılanda (handleSelectDiscussion) real şərhlər ayrıca yüklənir.
+function mapDiscussionDtoToLocal(d: any): Discussion {
+  return {
+    id: d.id,
+    title: d.title,
+    content: d.content,
+    category: backendCategoryToAzeri(d.category),
+    author: d.author,
+    authorAvatar: d.authorAvatar,
+    likes: d.likes,
+    isLikedByCurrentUser: !!d.isLikedByCurrentUser,
+    comments: Array.from({ length: d.commentsCount || 0 }, (_, i) => ({
+      id: `placeholder_${i}`,
+      author: '',
+      authorAvatar: '',
+      content: '',
+      date: ''
+    })) as Comment[],
+    date: d.createdAt
+      ? new Date(d.createdAt).toLocaleString('az-AZ', { year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' })
+      : ''
+  };
+}
+
+function mapCommentDtoToLocal(c: any): Comment {
+  return {
+    id: c.id,
+    author: c.author,
+    authorAvatar: c.authorAvatar,
+    content: c.content,
+    date: c.createdAt
+      ? new Date(c.createdAt).toLocaleString('az-AZ', { hour: '2-digit', minute: '2-digit' })
+      : 'İndi'
+  };
+}
+
 export default function Forum({
   discussions,
   setDiscussions,
@@ -114,11 +185,15 @@ export default function Forum({
   const [searchQuery, setSearchQuery] = useState('');
   const [isCreating, setIsCreating] = useState(false);
   const [selectedDiscussion, setSelectedDiscussion] = useState<Discussion | null>(null);
+  const [isLoadingThread, setIsLoadingThread] = useState(false);
+  const { data: discussionsData, isLoading: isLoadingDiscussions, refetch: refetchDiscussions } = useDiscussionsQuery();
+  const createDiscussionMutation = useCreateDiscussionMutation();
 
   // New discussion form
   const [newTitle, setNewTitle] = useState('');
   const [newContent, setNewContent] = useState('');
   const [newCategory, setNewCategory] = useState<'Rəylər' | 'Tövsiyələr' | 'Yeni Filmlər' | 'Nəzəriyyələr'>('Rəylər');
+  const [isSubmittingDiscussion, setIsSubmittingDiscussion] = useState(false);
 
   // Edit discussion form
   const [editingDiscussion, setEditingDiscussion] = useState<Discussion | null>(null);
@@ -137,6 +212,39 @@ export default function Forum({
   const [isRecordingVoice, setIsRecordingVoice] = useState(false);
   const [voiceDuration, setVoiceDuration] = useState(0);
   const recordingIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
+
+  // Backend-dən real müzakirələri yüklə (React Query)
+  useEffect(() => {
+    if (discussionsData) {
+      setDiscussions(discussionsData.map(mapDiscussionDtoToLocal));
+    }
+  }, [discussionsData, setDiscussions]);
+
+  // Müzakirəni açanda tam şərh siyahısını backend-dən yüklə
+  const handleSelectDiscussion = async (disc: Discussion) => {
+    setSelectedDiscussion(disc);
+    setIsLoadingThread(true);
+    try {
+      const detail = await apiGetDiscussionById(disc.id);
+      if (detail) {
+        const fullDisc: Discussion = {
+          ...disc,
+          title: detail.title,
+          content: detail.content,
+          category: backendCategoryToAzeri(detail.category),
+          likes: detail.likes,
+          isLikedByCurrentUser: !!detail.isLikedByCurrentUser,
+          comments: Array.isArray(detail.comments) ? detail.comments.map(mapCommentDtoToLocal) : []
+        };
+        setSelectedDiscussion(fullDisc);
+        setDiscussions((prev) => prev.map((d) => (d.id === disc.id ? fullDisc : d)));
+      }
+    } catch (err) {
+      console.error('Müzakirə detalları yüklənərkən xəta:', err);
+    } finally {
+      setIsLoadingThread(false);
+    }
+  };
 
   useEffect(() => {
     if (isRecordingVoice) {
@@ -237,27 +345,47 @@ export default function Forum({
   // Categories list
   const categories: ForumCategory[] = ['Hamsı', 'Rəylər', 'Tövsiyələr', 'Yeni Filmlər', 'Nəzəriyyələr'];
 
-  // Handle New Discussion submit
-  const handleCreateDiscussion = (e: React.FormEvent) => {
+  // Handle New Discussion submit — indi real backend-ə (CreateDiscussionCommandHandler) göndərir
+  const handleCreateDiscussion = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!newTitle.trim() || !newContent.trim()) return;
+    if (!newTitle.trim() || !newContent.trim() || isSubmittingDiscussion) return;
 
-    const newDisc: Discussion = {
-      id: 'd_' + Date.now(),
-      title: newTitle.trim(),
-      content: newContent.trim(),
-      category: newCategory,
-      author: currentUser.username,
-      authorAvatar: currentUser.avatar,
-      likes: 0,
-      comments: [],
-      date: new Date().toISOString().split('T')[0] + ' ' + new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
-    };
+    const title = newTitle.trim();
+    const content = newContent.trim();
+    const category = newCategory;
 
-    setDiscussions((prev) => [newDisc, ...prev]);
-    setIsCreating(false);
-    setNewTitle('');
-    setNewContent('');
+    setIsSubmittingDiscussion(true);
+    try {
+      const newId = await createDiscussionMutation.mutateAsync({
+        title,
+        content,
+        category: CATEGORY_TO_ENUM_INDEX[category],
+      });
+
+      const newDisc: Discussion = {
+        id: newId || 'd_' + Date.now(),
+        title,
+        content,
+        category,
+        author: currentUser.username,
+        authorAvatar: currentUser.avatar,
+        likes: 0,
+        isLikedByCurrentUser: false,
+        comments: [],
+        date: new Date().toLocaleString('az-AZ', { year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' })
+      };
+
+      setDiscussions((prev) => [newDisc, ...prev]);
+      setIsCreating(false);
+      setNewTitle('');
+      setNewContent('');
+      refetchDiscussions();
+    } catch (err) {
+      console.error('Müzakirə yaradılarkən xəta:', err);
+      window.alert('Müzakirə yaradıla bilmədi. Zəhmət olmasa yenidən cəhd edin.');
+    } finally {
+      setIsSubmittingDiscussion(false);
+    }
   };
 
   // Handle Like Discussion (ToggleDiscussionLikeCommandHandler integration)
@@ -518,7 +646,7 @@ export default function Forum({
       await apiUpdateDiscussion(targetId, {
         title: editTitle.trim(),
         content: editContent.trim(),
-        category: editCategory
+        category: CATEGORY_TO_ENUM_INDEX[editCategory]
       });
     } catch (err) {
       console.error('Müzakirə yenilənərkən xəta yarandı:', err);
@@ -635,9 +763,10 @@ export default function Forum({
               </button>
               <button
                 type="submit"
-                className="py-2.5 px-6 rounded-xl text-xs font-semibold bg-red-600 hover:bg-red-500 text-white transition cursor-pointer shadow-lg shadow-red-600/20"
+                disabled={isSubmittingDiscussion}
+                className="py-2.5 px-6 rounded-xl text-xs font-semibold bg-red-600 hover:bg-red-500 disabled:opacity-50 disabled:cursor-not-allowed text-white transition cursor-pointer shadow-lg shadow-red-600/20"
               >
-                Müzakirəni Dərc Et
+                {isSubmittingDiscussion ? 'Dərc edilir...' : 'Müzakirəni Dərc Et'}
               </button>
             </div>
           </form>
@@ -785,10 +914,10 @@ export default function Forum({
             <div className="flex items-center justify-between mb-4">
               <div className="flex items-center gap-3">
                 <img
-                  src={selectedDiscussion.authorAvatar}
-                  alt={selectedDiscussion.author}
-                  className="w-9 h-9 rounded-full object-cover ring-2 ring-red-500/10"
-                />
+  src={getAvatarUrl(selectedDiscussion.authorAvatar, selectedDiscussion.author)}
+  alt={selectedDiscussion.author}
+  className="w-9 h-9 rounded-full object-cover ring-2 ring-red-500/10"
+/>
                 <div>
                   <p className="text-xs font-bold">@{selectedDiscussion.author}</p>
                   <p className="text-[10px] text-zinc-500 font-mono">{selectedDiscussion.date}</p>
@@ -852,6 +981,10 @@ export default function Forum({
           {/* Comments List */}
           <div className="space-y-4">
             <h3 className="text-sm font-bold text-zinc-400">Şərhlər ({selectedDiscussion.comments.length})</h3>
+
+            {isLoadingThread && (
+              <p className="text-[10px] text-zinc-500 font-mono">Şərhlər yüklənir...</p>
+            )}
             
             <div className="space-y-3">
               {selectedDiscussion.comments.map((comment, index) => (
@@ -861,11 +994,11 @@ export default function Forum({
                     theme === 'dark' ? 'bg-zinc-900/20 border-zinc-800/60' : 'bg-zinc-50 border-zinc-200/60'
                   } flex gap-3`}
                 >
-                  <img
-                    src={comment.authorAvatar}
-                    alt={comment.author}
-                    className="w-8 h-8 rounded-full object-cover mt-0.5"
-                  />
+                 <img
+  src={getAvatarUrl(comment.authorAvatar, comment.author)}
+  alt={comment.author}
+  className="w-8 h-8 rounded-full object-cover mt-0.5"
+/>
                   <div className="flex-1">
                     <div className="flex items-center justify-between mb-1">
                       <div className="flex items-baseline gap-2">
@@ -1085,7 +1218,11 @@ export default function Forum({
 
           {/* Discussions feed */}
           <div className="lg:col-span-3 space-y-4">
-            {filteredDiscussions.length === 0 ? (
+            {isLoadingDiscussions ? (
+              <div className="text-center py-16 border border-dashed border-zinc-850 rounded-3xl">
+                <p className="text-sm text-zinc-500">Müzakirələr yüklənir...</p>
+              </div>
+            ) : filteredDiscussions.length === 0 ? (
               <div className="text-center py-16 border border-dashed border-zinc-850 rounded-3xl">
                 <p className="text-sm text-zinc-500">Meyarlara uyğun heç bir müzakirə tapılmadı.</p>
               </div>
@@ -1093,7 +1230,7 @@ export default function Forum({
               filteredDiscussions.map((d, index) => (
                 <motion.div
                   key={d.id ? `disc_${d.id}_${index}` : index}
-                  onClick={() => setSelectedDiscussion(d)}
+                  onClick={() => handleSelectDiscussion(d)}
                   initial={{ opacity: 0, x: index % 2 === 0 ? -45 : 45, y: 25, scale: 0.94 }}
                   animate={{ opacity: 1, x: 0, y: 0, scale: 1 }}
                   transition={{ duration: 0.9, ease: [0.16, 1, 0.3, 1] }}
@@ -1103,7 +1240,7 @@ export default function Forum({
                 >
                   <div className="flex items-center justify-between mb-3.5">
                     <div className="flex items-center gap-2.5">
-                      <img src={d.authorAvatar} alt={d.author} className="w-7 h-7 rounded-full object-cover" />
+                      <img src={getAvatarUrl(d.authorAvatar, d.author)} alt={d.author} className="w-7 h-7 rounded-full object-cover" />
                       <span className="text-xs font-semibold">@{d.author}</span>
                       <span className="text-[10px] text-zinc-500 font-mono">• {d.date}</span>
                     </div>

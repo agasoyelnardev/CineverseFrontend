@@ -1,7 +1,8 @@
 import React, { useState } from 'react';
 import { Sparkles, Check, X, ShieldCheck, Zap, Tv, Mic, Award, CreditCard, AlertCircle } from 'lucide-react';
 import { User } from '../types';
-import { apiSubscribe, apiCancelSubscription, PremiumPlan } from '../api';
+import { apiSubscribe, apiCancelSubscription, apiGetMe, apiGetUserProfile, PremiumPlan } from '../api';
+import { getHighestBadgeForPoints } from './GamificationBadges';
 
 interface PremiumModalProps {
   isOpen: boolean;
@@ -29,6 +30,17 @@ export default function PremiumModal({
 
   if (!isOpen || !currentUser) return null;
 
+  const refreshUserPremiumStatus = async (): Promise<User> => {
+    const me = await apiGetMe();
+    const profile = await apiGetUserProfile(me.id);
+    return {
+      ...currentUser,
+      isPremium: profile.isPremium,
+      points: profile.points,
+      badge: getHighestBadgeForPoints(profile.points ?? 0).name,
+    };
+  };
+
   const handleNextStep = () => {
     if (step === 'plans') {
       setStep('payment');
@@ -42,16 +54,8 @@ export default function PremiumModal({
 
     try {
       const planEnum = selectedPlan === 'monthly' ? PremiumPlan.Monthly : PremiumPlan.Yearly;
-      // Try calling backend API
-      await apiSubscribe(planEnum).catch(() => {
-        // Fallback if backend server endpoint is offline
-        console.log('Backend API offline, applying local state updates');
-      });
-
-      const updatedUser: User = {
-        ...currentUser,
-        isPremium: true
-      };
+      await apiSubscribe(planEnum);
+      const updatedUser = await refreshUserPremiumStatus();
       onUpgradeSuccess(updatedUser);
       setStep('success');
     } catch (err: any) {
@@ -67,14 +71,8 @@ export default function PremiumModal({
     setErrorMessage(null);
 
     try {
-      await apiCancelSubscription().catch(() => {
-        console.log('Backend API offline, applying local cancellation');
-      });
-
-      const updatedUser: User = {
-        ...currentUser,
-        isPremium: false
-      };
+      await apiCancelSubscription();
+      const updatedUser = await refreshUserPremiumStatus();
       onUpgradeSuccess(updatedUser);
       alert('Abunəlik uğurla ləğv edildi.');
       onClose();
@@ -150,7 +148,8 @@ export default function PremiumModal({
                 { icon: Tv, title: 'Reklamsız & Kəsintisiz', desc: 'Sonsuz kino zövqü, sıfır reklam.' },
                 { icon: Zap, title: '4K Ultra HD Keyfiyyət', desc: 'Bütün yayımları ən yüksək detalla izləyin.' },
                 { icon: Mic, title: 'Səsli Rəy Yazma', desc: 'Müzakirələrdə mikrofonla rəy bildirin.' },
-                { icon: Award, title: 'Profil Nişanı (Glow Badge)', desc: 'İcmada qızılı rəngli Premium nişanı.' }
+                { icon: Award, title: 'Profil Nişanı (Glow Badge)', desc: 'İcmada qızılı rəngli Premium nişanı.' },
+                { icon: Sparkles, title: 'Premium Watch Party', desc: 'Premium otaqlar yaradın və ekskluziv yayimlara qoşulun.' }
               ].map((f, i) => (
                 <div key={i} className={`flex gap-3 p-3 rounded-2xl border ${
                   theme === 'dark' ? 'bg-zinc-900/40 border-zinc-850' : 'bg-zinc-50 border-zinc-100'

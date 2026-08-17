@@ -23,7 +23,69 @@ export function removeAuthToken() {
   localStorage.removeItem('cineverse_refresh_token');
 }
 
-async function request<T>(endpoint: string, options: RequestInit = {}): Promise<T> {
+const AUTH_NO_RETRY_PATHS = ['/auth/refresh', '/auth/login', '/auth/register'];
+
+function isAuthNoRetryPath(endpoint: string): boolean {
+  const lower = endpoint.toLowerCase();
+  return AUTH_NO_RETRY_PATHS.some((path) => lower.startsWith(path));
+}
+
+let refreshPromise: Promise<boolean> | null = null;
+
+/** Raw fetch — request() interceptorundan keçmir. */
+async function performTokenRefresh(): Promise<boolean> {
+  const refreshToken = getRefreshToken();
+  if (!refreshToken) return false;
+
+  try {
+    const response = await fetch(`${API_BASE_URL}/auth/refresh`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ refreshToken }),
+    });
+
+    if (!response.ok) return false;
+
+    const data = await response.json();
+    const accessToken = data.accessToken || data.token;
+    if (accessToken) setAuthToken(accessToken);
+    if (data.refreshToken) setRefreshToken(data.refreshToken);
+    return !!accessToken;
+  } catch {
+    return false;
+  }
+}
+
+function ensureTokenRefreshed(): Promise<boolean> {
+  if (!refreshPromise) {
+    refreshPromise = performTokenRefresh().finally(() => {
+      refreshPromise = null;
+    });
+  }
+  return refreshPromise;
+}
+
+/** Şəbəkə/qoşulma xətası — boş `{}` cavabından fərqləndirmək üçün. */
+export class ApiNetworkError extends Error {
+  readonly endpoint: string;
+
+  constructor(endpoint: string, cause?: unknown) {
+    super(`Şəbəkə xətası: serverə qoşulmaq mümkün olmadı (${endpoint})`);
+    this.name = 'ApiNetworkError';
+    this.endpoint = endpoint;
+    if (cause !== undefined) {
+      (this as Error & { cause?: unknown }).cause = cause;
+    }
+  }
+}
+
+function isNetworkFetchError(err: unknown): boolean {
+  if (err instanceof TypeError) return true;
+  if (err instanceof Error && err.message.toLowerCase().includes('fetch')) return true;
+  return false;
+}
+
+async function request<T>(endpoint: string, options: RequestInit = {}, hasRetried = false): Promise<T> {
   const token = getAuthToken();
   const headers: HeadersInit = {
     'Content-Type': 'application/json',
@@ -39,6 +101,18 @@ async function request<T>(endpoint: string, options: RequestInit = {}): Promise<
       ...options,
       headers,
     });
+
+    if (
+      response.status === 401 &&
+      !hasRetried &&
+      !isAuthNoRetryPath(endpoint)
+    ) {
+      const refreshed = await ensureTokenRefreshed();
+      if (refreshed) {
+        return request<T>(endpoint, options, true);
+      }
+      removeAuthToken();
+    }
 
     if (!response.ok) {
       const errorText = await response.text();
@@ -63,11 +137,13 @@ async function request<T>(endpoint: string, options: RequestInit = {}): Promise<
     }
 
     return response.text() as unknown as T;
-  } catch (err: any) {
-    // Graceful fallback for network connectivity errors (e.g., Failed to fetch)
-    if (err instanceof TypeError || (err.message && err.message.toLowerCase().includes('fetch'))) {
-      console.debug(`[API] Şəbəkə sorğusu uğursuz oldu (${endpoint}):`, err.message);
-      return {} as T;
+  } catch (err: unknown) {
+    if (isNetworkFetchError(err)) {
+      console.debug(
+        `[API] Şəbəkə sorğusu uğursuz oldu (${endpoint}):`,
+        err instanceof Error ? err.message : String(err),
+      );
+      throw new ApiNetworkError(endpoint, err);
     }
     throw err;
   }
@@ -215,6 +291,27 @@ export async function apiImportTmdb(tmdbId: number) {
   });
 }
 
+export interface BatchImportItemResult {
+  externalId: number | string;
+  success: boolean;
+  entityId?: string;
+  error?: string;
+}
+
+export interface BatchImportResult {
+  total: number;
+  succeeded: number;
+  failed: number;
+  results: BatchImportItemResult[];
+}
+
+export async function apiImportTmdbBatch(tmdbIds: number[]) {
+  return request<BatchImportResult>('/movies/tmdb/import/batch', {
+    method: 'POST',
+    body: JSON.stringify({ tmdbIds }),
+  });
+}
+
 // ==================== BOOKS API ====================
 export interface CreateBookPayload {
   title: string;
@@ -262,6 +359,50 @@ function buildBookFormData(payload: CreateBookPayload, id?: string): FormData {
   return formData;
 }
 
+async function submitBookFormData(url: string, method: 'POST' | 'PUT', formData: FormData): Promise<any> {
+  const token = getAuthToken();
+  const headers: Record<string, string> = {};
+  if (token) {
+    headers['Authorization'] = `Bearer ${token}`;
+  }
+
+  try {
+    const response = await fetch(`${API_BASE_URL}${url}`, {
+      method,
+      headers,
+      body: formData,
+    });
+
+    if (!response.ok) {
+      const errorText = await response.text();
+      let message = `API Xətası (${response.status})`;
+      try {
+        const parsed = JSON.parse(errorText);
+        message = parsed.message || parsed.title || message;
+      } catch {
+        if (errorText) message = errorText;
+      }
+      throw new Error(message);
+    }
+
+    if (response.status === 204) {
+      return {};
+    }
+
+    const contentType = response.headers.get('content-type');
+    if (contentType && contentType.includes('application/json')) {
+      return response.json();
+    }
+
+    return response.text();
+  } catch (err: unknown) {
+    if (isNetworkFetchError(err)) {
+      throw new ApiNetworkError(url, err);
+    }
+    throw err;
+  }
+}
+
 export async function apiGetBooks(paramsObj?: {
   pageNumber?: number;
   pageSize?: number;
@@ -304,72 +445,13 @@ export async function apiGetBookById(id: string) {
 }
 
 export async function apiCreateBook(payload: CreateBookPayload) {
-  // Try sending FormData (required for [FromForm] ASP.NET Core)
   const formData = buildBookFormData(payload);
-  const token = getAuthToken();
-  const headers: Record<string, string> = {};
-  if (token) {
-    headers['Authorization'] = `Bearer ${token}`;
-  }
-
-  try {
-    const response = await fetch(`${API_BASE_URL}/books`, {
-      method: 'POST',
-      headers,
-      body: formData,
-    });
-
-    if (response.ok) {
-      const contentType = response.headers.get('content-type');
-      if (contentType && contentType.includes('application/json')) {
-        return await response.json();
-      }
-      return await response.text();
-    }
-  } catch (err) {
-    console.log('FormData apiCreateBook notice, falling back to JSON request:', err);
-  }
-
-  // Fallback to JSON request if FormData is rejected
-  return request<any>('/books', {
-    method: 'POST',
-    body: JSON.stringify(payload),
-  });
+  return submitBookFormData('/books', 'POST', formData);
 }
 
 export async function apiUpdateBook(id: string, payload: CreateBookPayload) {
-  // Try sending FormData (required for [FromForm] ASP.NET Core)
   const formData = buildBookFormData(payload, id);
-  const token = getAuthToken();
-  const headers: Record<string, string> = {};
-  if (token) {
-    headers['Authorization'] = `Bearer ${token}`;
-  }
-
-  try {
-    const response = await fetch(`${API_BASE_URL}/books/${id}`, {
-      method: 'PUT',
-      headers,
-      body: formData,
-    });
-
-    if (response.ok) {
-      if (response.status === 204) return {};
-      const contentType = response.headers.get('content-type');
-      if (contentType && contentType.includes('application/json')) {
-        return await response.json();
-      }
-      return await response.text();
-    }
-  } catch (err) {
-    console.log('FormData apiUpdateBook notice, falling back to JSON request:', err);
-  }
-
-  // Fallback to JSON
-  return request<any>(`/books/${id}`, {
-    method: 'PUT',
-    body: JSON.stringify({ id, ...payload }),
-  });
+  return submitBookFormData(`/books/${id}`, 'PUT', formData);
 }
 
 export async function apiDeleteBook(id: string) {
@@ -378,38 +460,125 @@ export async function apiDeleteBook(id: string) {
   });
 }
 
-export async function apiSearchGoogleBooks(query: string) {
-  try {
-    const res = await request<any>(`/books/googlebooks/search?query=${encodeURIComponent(query)}`, {
-      method: 'GET',
-    });
-    if (Array.isArray(res)) return res;
-    if (res && Array.isArray(res.items)) return res.items;
-    if (res && Array.isArray(res.books)) return res.books;
-    if (res && Array.isArray(res.results)) return res.results;
-  } catch {
-    // fallback to direct Google Books API call if backend endpoint returns error or is unconfigured
+export interface GoogleBooksSearchItem {
+  id: string;
+  googleBooksId?: string;
+  title?: string;
+  author?: string;
+  coverUrl?: string;
+  volumeInfo?: {
+    title?: string;
+    authors?: string[];
+    pageCount?: number;
+    imageLinks?: { thumbnail?: string };
+  };
+}
+
+export interface GoogleBooksSearchResponse {
+  items: GoogleBooksSearchItem[];
+  warning?: string;
+}
+
+function normalizeGoogleBooksItem(raw: any): GoogleBooksSearchItem | null {
+  if (!raw) return null;
+
+  const id = String(raw.id ?? raw.googleBooksId ?? raw.GoogleBooksId ?? '');
+  if (!id) return null;
+
+  if (raw.volumeInfo) {
+    return {
+      id,
+      googleBooksId: id,
+      volumeInfo: raw.volumeInfo,
+    };
   }
 
-  try {
-    const fetchRes = await fetch(`https://www.googleapis.com/books/v1/volumes?q=${encodeURIComponent(query)}`);
-    if (fetchRes.ok) {
-      const data = await fetchRes.json();
-      if (data && Array.isArray(data.items)) {
-        return data.items;
-      }
+  const title = raw.title ?? raw.Title ?? 'Adsız kitab';
+  const author = raw.author ?? raw.Author ?? '';
+  const coverUrl = raw.coverUrl ?? raw.CoverUrl ?? '';
+
+  return {
+    id,
+    googleBooksId: id,
+    title,
+    author,
+    coverUrl,
+    volumeInfo: {
+      title,
+      authors: author ? [author] : [],
+      imageLinks: coverUrl ? { thumbnail: coverUrl } : undefined,
+    },
+  };
+}
+
+async function fetchGoogleBooksDirect(query: string): Promise<GoogleBooksSearchItem[]> {
+  const encoded = encodeURIComponent(query.trim());
+  const delays = [0, 1500, 3000];
+
+  for (let attempt = 0; attempt < delays.length; attempt++) {
+    if (delays[attempt] > 0) {
+      await new Promise((resolve) => setTimeout(resolve, delays[attempt]));
     }
-  } catch {
-    // ignore
+
+    try {
+      const response = await fetch(`https://www.googleapis.com/books/v1/volumes?q=${encoded}&maxResults=20`);
+      if (!response.ok) continue;
+      const data = await response.json();
+      if (!Array.isArray(data?.items)) return [];
+      return data.items
+        .map(normalizeGoogleBooksItem)
+        .filter((item): item is GoogleBooksSearchItem => item !== null);
+    } catch {
+      // növbəti cəhd
+    }
   }
 
   return [];
 }
 
+export async function apiSearchGoogleBooks(query: string): Promise<GoogleBooksSearchResponse> {
+  try {
+    const res = await request<any>(`/books/googlebooks/search?query=${encodeURIComponent(query)}`, {
+      method: 'GET',
+    });
+
+    const rawItems = Array.isArray(res)
+      ? res
+      : (res?.items ?? res?.books ?? res?.results ?? []);
+
+    const items = rawItems
+      .map(normalizeGoogleBooksItem)
+      .filter((item): item is GoogleBooksSearchItem => item !== null);
+
+    if (items.length > 0) {
+      return { items };
+    }
+  } catch {
+    // backend fallback
+  }
+
+  const directItems = await fetchGoogleBooksDirect(query);
+  if (directItems.length > 0) {
+    return { items: directItems };
+  }
+
+  return {
+    items: [],
+    warning:
+      'Google Books hazırda cavab vermir. Bir neçə dəqiqə sonra yenidən cəhd edin və ya kitabı PDF/link ilə əl ilə əlavə edin.',
+  };
+}
+
 export async function apiImportGoogleBook(googleBooksId: string) {
-  return request<any>(`/books/googlebooks/import/${googleBooksId}`, {
+  const importedId = await request<string>(`/books/googlebooks/import/${googleBooksId}`, {
     method: 'POST',
   });
+
+  const bookId = typeof importedId === 'string'
+    ? importedId
+    : String((importedId as any)?.id ?? (importedId as any)?.Id ?? importedId);
+
+  return apiGetBookById(bookId);
 }
 
 export async function apiUploadPdf(file: File): Promise<{ pdfUrl: string }> {
@@ -506,6 +675,13 @@ export async function apiUpdateProfile(payload: { fullName?: string; avatar?: st
       avatar: payload.avatar || '',
       bio: payload.bio || '',
     }),
+  });
+}
+
+export async function apiAddMyPoints(points: number) {
+  return request<{ points: number }>('/users/me/points', {
+    method: 'POST',
+    body: JSON.stringify(points),
   });
 }
 
@@ -610,13 +786,12 @@ export async function apiRefreshToken() {
   const refreshToken = getRefreshToken();
   if (!refreshToken) throw new Error('Refresh token yoxdur.');
 
-  const data = await request<{ accessToken?: string; refreshToken?: string }>('/auth/refresh', {
-    method: 'POST',
-    body: JSON.stringify({ refreshToken }),
-  });
-  if (data.accessToken) setAuthToken(data.accessToken);
-  if (data.refreshToken) setRefreshToken(data.refreshToken);
-  return data;
+  const ok = await performTokenRefresh();
+  if (!ok) throw new Error('Token yenilənmədi.');
+  return {
+    accessToken: getAuthToken() ?? undefined,
+    refreshToken: getRefreshToken() ?? undefined,
+  };
 }
 
 export async function apiGetMe() {
@@ -651,7 +826,13 @@ export async function apiChangePassword(payload: { currentPassword?: string; new
 
 // ==================== AI CHAT API ====================
 export async function apiAskAiChat(prompt: string) {
-  return request<{ reply: string; text?: string; response?: string }>('/aichat/ask', {
+  return request<{
+    reply: string;
+    text?: string;
+    response?: string;
+    recommendedMovieIds?: string[];
+    recommendedBookIds?: string[];
+  }>('/aichat/ask', {
     method: 'POST',
     body: JSON.stringify({ prompt, message: prompt }),
   });
@@ -709,8 +890,10 @@ export interface RecentUserDto {
 
 export interface RecentReviewDto {
   id: string;
+  type?: string;
+  targetTitle?: string;
+  movieTitle?: string;
   username: string;
-  movieTitle: string;
   rating: number;
   content: string;
   createdAt: string;
@@ -794,6 +977,75 @@ export async function apiDeleteAdminBookReview(id: string) {
 export async function apiCloseAdminRoom(id: string) {
   return request<void>(`/admin/rooms/${id}/close`, {
     method: 'POST',
+  });
+}
+
+export interface TopMovieAnalyticsItem {
+  id: string;
+  title: string;
+  poster: string;
+  viewCount: number;
+  likes: number;
+  rating: number;
+}
+
+export interface TopRoomAnalyticsItem {
+  id: string;
+  title: string;
+  currentViewerCount: number;
+  peakViewerCount: number;
+  isLive: boolean;
+  movieTitle?: string;
+}
+
+export interface TopContentAnalytics {
+  topMovies: TopMovieAnalyticsItem[];
+  topRooms: TopRoomAnalyticsItem[];
+}
+
+export async function apiGetAdminTopContentAnalytics(limit = 10) {
+  return request<TopContentAnalytics>(`/admin/analytics/top-content?limit=${limit}`, {
+    method: 'GET',
+  });
+}
+
+export interface ModerationReviewItem {
+  id: string;
+  type: string;
+  targetTitle: string;
+  username: string;
+  rating: number;
+  content: string;
+  createdAt: string;
+}
+
+export interface ModerationDiscussionItem {
+  id: string;
+  title: string;
+  content: string;
+  author: string;
+  category: string;
+  commentsCount: number;
+  likes: number;
+  createdAt: string;
+}
+
+export interface ModerationContent {
+  reviews: ModerationReviewItem[];
+  discussions: ModerationDiscussionItem[];
+}
+
+export async function apiGetAdminModerationContent(reviewLimit = 30, discussionLimit = 30) {
+  return request<ModerationContent>(
+    `/admin/moderation?reviewLimit=${reviewLimit}&discussionLimit=${discussionLimit}`,
+    { method: 'GET' },
+  );
+}
+
+export async function apiImportGoogleBookBatch(googleBooksIds: string[]) {
+  return request<BatchImportResult>('/books/googlebooks/import/batch', {
+    method: 'POST',
+    body: JSON.stringify({ googleBooksIds }),
   });
 }
 
@@ -1097,6 +1349,8 @@ export async function apiDeleteChatMessage(id: string) {
   });
 }
 
+
+
 export async function apiUpdateChatMessage(id: string, messageText: string) {
   return request<any>(`/chats/${id}`, {
     method: 'PUT',
@@ -1259,6 +1513,8 @@ export async function apiGetDiscussions(category?: string | number, page: number
     method: 'GET',
   });
 }
+
+
 
 export async function apiGetDiscussionById(id: string) {
   return request<DiscussionDetailDto>(`/discussions/${id}`, {
@@ -1588,12 +1844,40 @@ export interface RoomDto {
   coverImageUrl?: string;
   createdByUserId: string;
   movieId?: string;
+  movieTitle?: string;
+  movieDescription?: string;
+  moviePoster?: string;
+  movieTrailerUrl?: string;
+  movieVideoUrl?: string;
+  isPrivate?: boolean;
+}
+
+export interface RoomPreviewDto {
+  id: string;
+  title: string;
+  isPrivate: boolean;
+  isPremium: boolean;
+  isLive: boolean;
+  viewerCount: number;
+  canPreviewDetails: boolean;
+  canJoinWithAuth: boolean;
+  movieId?: string;
+  movieTitle?: string;
+  movieDescription?: string;
+  moviePoster?: string;
+  movieTrailerUrl?: string;
+  movieVideoUrl?: string;
+  createdByUserId: string;
+  inviteToken?: string | null;
 }
 
 export interface CreateRoomPayload {
   roomName: string;
   type?: string;
   movieId?: string;
+  streamUrl?: string;
+  isPrivate?: boolean;
+  isPremium?: boolean;
 }
 
 export async function apiGetActiveRooms() {
@@ -1603,9 +1887,23 @@ export async function apiGetActiveRooms() {
 }
 
 export async function apiCreateRoom(payload: CreateRoomPayload) {
-  return request<{ message: string; roomId: string }>('/rooms/create', {
+  return request<{ message: string; roomId: string; inviteToken?: string }>('/rooms/create', {
     method: 'POST',
     body: JSON.stringify(payload),
+  });
+}
+
+export async function apiGetRoomById(roomId: string, inviteToken?: string) {
+  const params = inviteToken ? `?invite=${encodeURIComponent(inviteToken)}` : '';
+  return request<RoomPreviewDto>(`/rooms/${roomId}${params}`, {
+    method: 'GET',
+  });
+}
+
+export async function apiJoinRoomWithInviteToken(roomId: string, inviteToken: string) {
+  return request<{ message: string }>(`/rooms/${roomId}/join-with-token`, {
+    method: 'POST',
+    body: JSON.stringify({ inviteToken }),
   });
 }
 
@@ -1708,6 +2006,19 @@ export async function apiSendLiveStreamMessage(payload: SendLiveStreamMessagePay
   });
 }
 
+export async function apiUpdateLiveStreamMessage(id: string, messageText: string) {
+  return request<void>(`/livestreams/chat-message/${id}`, {
+    method: 'PUT',
+    body: JSON.stringify({ id, messageText }),
+  });
+}
+
+export async function apiDeleteLiveStreamMessage(id: string) {
+  return request<void>(`/livestreams/chat-message/${id}`, {
+    method: 'DELETE',
+  });
+}
+
 export async function apiGetLiveStreamSchedule() {
   return request<LiveStreamScheduleDto[]>('/livestreams/schedule', {
     method: 'GET',
@@ -1728,8 +2039,15 @@ export async function apiToggleLiveStream(id: string) {
   });
 }
 
+export async function apiUpdateLiveStreamChannel(id: string, payload: Partial<CreateLiveStreamPayload>) {
+  return request<any>(`/livestreams/admin/${id}`, {
+    method: 'PUT',
+    body: JSON.stringify({ id, ...payload }),
+  });
+}
 
-
-
-
-
+export async function apiDeleteLiveStreamChannel(id: string) {
+  return request<any>(`/livestreams/admin/${id}`, {
+    method: 'DELETE',
+  });
+}

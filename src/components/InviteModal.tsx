@@ -4,6 +4,12 @@ import {
   MessageSquare, Sparkles, Popcorn, Clock, Send, Link, Video, Search
 } from 'lucide-react';
 import { Movie, WatchParty, User } from '../types';
+import { getWatchPartyUrl } from '../utils/watchPartyUrl';
+
+function resolvePartyShareUrl(party?: WatchParty | null) {
+  if (!party) return window.location.origin;
+  return getWatchPartyUrl(party.id, party.isPrivate ? party.inviteToken : undefined);
+}
 
 interface InviteModalProps {
   isOpen: boolean;
@@ -11,10 +17,11 @@ interface InviteModalProps {
   movies: Movie[];
   currentUser: User | null;
   users?: User[];
+  inviteDirectory?: User[];
   theme: 'dark' | 'light';
   selectedMovie?: Movie | null;
   activeParty?: WatchParty | null;
-  onCreateWatchParty?: (roomName: string, movieId: string) => WatchParty | null;
+  onCreateWatchParty?: (roomName: string, movieId: string) => WatchParty | null | Promise<WatchParty | null>;
   onSendInviteToFriend?: (friendId: string, partyId: string, roomName?: string) => void;
 }
 
@@ -24,6 +31,7 @@ export default function InviteModal({
   movies,
   currentUser,
   users = [],
+  inviteDirectory,
   theme,
   selectedMovie,
   activeParty,
@@ -84,6 +92,10 @@ export default function InviteModal({
 
   if (!isOpen) return null;
 
+  const inviteList = (inviteDirectory && inviteDirectory.length > 0)
+    ? inviteDirectory
+    : users.filter((u) => u.id !== currentUser?.id);
+
   const currentMovie = movies.find(m => m.id === chosenMovieId) || selectedMovie || movies[0];
 
   // Helper: Format Google Calendar Template URL
@@ -91,9 +103,9 @@ export default function InviteModal({
     if (!currentMovie) return '#';
     const title = `CineVerse Film Gecəsi: ${currentMovie.title}`;
     const description = `${inviteNotes}\n\nFilm: ${currentMovie.title}\nRejissor: ${currentMovie.director}\nMüddət: ${currentMovie.duration}\nPlatforma: ${window.location.origin}`;
-    const location = activeParty 
-      ? `${window.location.origin}/watch-party/${activeParty.id}` 
-      : (createdParty ? `${window.location.origin}/watch-party/${createdParty.id}` : window.location.origin);
+    const location = activeParty
+      ? resolvePartyShareUrl(activeParty)
+      : (createdParty ? resolvePartyShareUrl(createdParty) : window.location.origin);
 
     // Date calculations
     const pad = (n: number) => n.toString().padStart(2, '0');
@@ -120,9 +132,9 @@ export default function InviteModal({
     if (!currentMovie) return;
     const title = `CineVerse: ${currentMovie.title} Gecəsi`;
     const description = inviteNotes;
-    const location = activeParty 
-      ? `${window.location.origin}/watch-party/${activeParty.id}` 
-      : (createdParty ? `${window.location.origin}/watch-party/${createdParty.id}` : window.location.origin);
+    const location = activeParty
+      ? resolvePartyShareUrl(activeParty)
+      : (createdParty ? resolvePartyShareUrl(createdParty) : window.location.origin);
 
     const dt = new Date(`${eventDate}T${eventTime}:00`);
     if (isNaN(dt.getTime())) return;
@@ -170,20 +182,19 @@ export default function InviteModal({
     if (!currentMovie) return '';
     const dateFormatted = eventDate ? new Date(eventDate).toLocaleDateString('az-AZ', { day: 'numeric', month: 'long', year: 'numeric' }) : '';
     const timeFormatted = eventTime || '';
-    const location = activeParty 
-      ? `CineVerse Watch Party 🔴 (${window.location.origin}/watch-party/${activeParty.id})` 
-      : (createdParty ? `CineVerse Watch Party 🔴 (${window.location.origin}/watch-party/${createdParty.id})` : `CineVerse Kinoteatrı 🎬 (${window.location.origin})`);
+    const location = activeParty
+      ? `CineVerse Watch Party 🔴 (${resolvePartyShareUrl(activeParty)})`
+      : (createdParty ? `CineVerse Watch Party 🔴 (${resolvePartyShareUrl(createdParty)})` : `CineVerse Kinoteatrı 🎬 (${window.location.origin})`);
 
     return `🍿 Film Gecəsi Dəvəti! 🍿\n\nSəni birlikdə film izləməyə dəvət edirəm!\n\n🎬 Film: ${currentMovie.title}\n📅 Tarix: ${dateFormatted}\n⏰ Saat: ${timeFormatted}\n📍 Platforma: ${location}\n\n💬 Qeyd: "${inviteNotes}"\n\nTəqviminizə əlavə etməyi və popkornları hazırlamağı unutmayın! 🎥✨`;
   };
 
   // Handle watch party creation in-place inside modal
-  const handleQuickCreateParty = () => {
+  const handleQuickCreateParty = async () => {
     if (!partyRoomName.trim() || !chosenMovieId || !onCreateWatchParty) return;
-    const newParty = onCreateWatchParty(partyRoomName.trim(), chosenMovieId);
+    const newParty = await onCreateWatchParty(partyRoomName.trim(), chosenMovieId);
     if (newParty) {
       setCreatedParty(newParty);
-      // Switch notes to mention active watch party URL
       setInviteNotes(`Gəl CineVerse-də birbaşa eyni anda canlı söhbət edərək "${currentMovie?.title || 'Film'}" izləyək! 🍿🔴`);
     }
   };
@@ -194,7 +205,10 @@ export default function InviteModal({
   };
 
   const getTelegramShareUrl = () => {
-    return `https://t.me/share/url?url=${encodeURIComponent(activeParty ? `${window.location.origin}/watch-party/${activeParty.id}` : (createdParty ? `${window.location.origin}/watch-party/${createdParty.id}` : window.location.origin))}&text=${encodeURIComponent(getInvitationText())}`;
+    const shareUrl = activeParty
+      ? resolvePartyShareUrl(activeParty)
+      : (createdParty ? resolvePartyShareUrl(createdParty) : window.location.origin);
+    return `https://t.me/share/url?url=${encodeURIComponent(shareUrl)}&text=${encodeURIComponent(getInvitationText())}`;
   };
 
   return (
@@ -401,7 +415,7 @@ export default function InviteModal({
                       <span>Təqib Etdiyiniz Dostların Siyahısı</span>
                     </div>
                     <span className="text-[10px] text-zinc-500 font-mono font-bold">
-                      {currentUser?.following?.length || 0} Dost
+                      {inviteList.length} Dost
                     </span>
                   </div>
 
@@ -423,18 +437,15 @@ export default function InviteModal({
 
                   <div className="space-y-2 max-h-52 overflow-y-auto pr-1">
                     {(() => {
-                      const followed = users.filter(u => currentUser?.following?.includes(u.id));
-                      const baseList = followed.length > 0 ? followed : users.filter(u => u.id !== currentUser?.id);
-                      
                       const query = friendSearchQuery.trim().toLowerCase();
                       const listToDisplay = query
-                        ? baseList.filter(u => u.name.toLowerCase().includes(query) || u.username.toLowerCase().includes(query))
-                        : baseList;
+                        ? inviteList.filter(u => u.name.toLowerCase().includes(query) || u.username.toLowerCase().includes(query))
+                        : inviteList;
 
                       if (listToDisplay.length === 0) {
                         return (
                           <div className="text-center py-6 text-xs text-zinc-500">
-                            {query ? 'Axtarışa uyğun dost tapılmadı.' : 'Hələ heç kimi təqib etmirsiniz. Sosyal bölməsindən kinosevərləri təqib edin!'}
+                            {query ? 'Axtarışa uyğun dost tapılmadı.' : 'Dəvət siyahınız boşdur. Sosial bölməsindən dost əlavə edin!'}
                           </div>
                         );
                       }

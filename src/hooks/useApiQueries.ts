@@ -15,6 +15,10 @@ export const QUERY_KEYS = {
   userFavorites: ['user', 'favorites'] as const,
   userWatchlist: ['user', 'watchlist'] as const,
   streamRooms: ['streamRooms'] as const,
+  discussions: (category?: string | number, page?: number) =>
+    ['discussions', { category, page }] as const,
+  liveStreams: ['liveStreams'] as const,
+  liveStreamSchedule: ['liveStreams', 'schedule'] as const,
 };
 
 // ==================== MOVIES HOOKS ====================
@@ -73,31 +77,89 @@ export function useBookDetailsQuery(id: string) {
 }
 
 // ==================== ADMIN HOOKS ====================
-export function useAdminStatsQuery() {
+export function useAdminStatsQuery(enabled = true) {
   return useQuery({
     queryKey: QUERY_KEYS.adminStats,
     queryFn: () => api.apiGetAdminStats(),
+    enabled,
   });
 }
 
-export function useAdminUsersQuery(search?: string, role?: string, page: number = 1, pageSize: number = 20) {
+export function useAdminUsersQuery(
+  search?: string,
+  role?: string,
+  page: number = 1,
+  pageSize: number = 20,
+  enabled = true,
+) {
   return useQuery({
     queryKey: QUERY_KEYS.adminUsers(search, role, page),
     queryFn: () => api.apiGetAdminUsers(search, role, page, pageSize),
+    enabled,
   });
 }
 
-export function useAdminActivityLogsQuery() {
+export function useAdminActivityLogsQuery(enabled = true) {
   return useQuery({
     queryKey: QUERY_KEYS.adminActivityLogs,
     queryFn: () => api.apiGetAdminActivityLogs(),
+    enabled,
   });
 }
 
-export function useAdminRecentActivityQuery() {
+export function useAdminRecentActivityQuery(enabled = true) {
   return useQuery({
     queryKey: QUERY_KEYS.adminRecentActivity,
     queryFn: () => api.apiGetAdminRecentActivity(),
+    enabled,
+  });
+}
+
+// ==================== DISCUSSIONS HOOKS ====================
+export function useDiscussionsQuery(
+  category?: string | number,
+  page: number = 1,
+  pageSize: number = 20,
+  enabled = true,
+) {
+  return useQuery({
+    queryKey: QUERY_KEYS.discussions(category, page),
+    queryFn: () => api.apiGetDiscussions(category, page, pageSize),
+    enabled,
+  });
+}
+
+export function useCreateDiscussionMutation() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: (payload: api.CreateDiscussionPayload) => api.apiCreateDiscussion(payload),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['discussions'] });
+    },
+  });
+}
+
+// ==================== LIVE STREAM HOOKS ====================
+export function useLiveStreamsQuery(enabled = true) {
+  return useQuery({
+    queryKey: QUERY_KEYS.liveStreams,
+    queryFn: async () => {
+      try {
+        const res = await api.apiGetLiveStreams();
+        return Array.isArray(res) ? res : [];
+      } catch {
+        return [];
+      }
+    },
+    enabled,
+  });
+}
+
+export function useLiveStreamScheduleQuery(enabled = true) {
+  return useQuery({
+    queryKey: QUERY_KEYS.liveStreamSchedule,
+    queryFn: () => api.apiGetLiveStreamSchedule(),
+    enabled,
   });
 }
 

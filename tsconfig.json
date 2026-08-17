@@ -17,11 +17,9 @@
     "allowJs": true,
     "jsx": "react-jsx",
     "paths": {
-      "@/*": [
-        "./src/*",
-        "./*"
-      ]
-    },
+  "@/*": ["./src/*"]
+}
+,
     "types": ["node"],
     "noEmit": true
   },

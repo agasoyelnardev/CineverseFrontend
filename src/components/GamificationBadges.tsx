@@ -113,6 +113,10 @@ export const BADGES_LIST: BadgeItem[] = [
   }
 ];
 
+export function getHighestBadgeForPoints(userPoints = 0): BadgeItem {
+  return [...BADGES_LIST].reverse().find(b => userPoints >= b.requiredPoints) ?? BADGES_LIST[0];
+}
+
 interface GamificationBadgesProps {
   userPoints: number;
   theme: 'dark' | 'light';
@@ -122,6 +126,7 @@ interface GamificationBadgesProps {
 export default function GamificationBadges({ userPoints = 0, theme, className = '' }: GamificationBadgesProps) {
   const [hoveredBadge, setHoveredBadge] = useState<BadgeItem | null>(null);
 
+  const currentBadge = getHighestBadgeForPoints(userPoints);
   const unlockedCount = BADGES_LIST.filter(b => userPoints >= b.requiredPoints).length;
   const totalCount = BADGES_LIST.length;
 
@@ -168,6 +173,18 @@ export default function GamificationBadges({ userPoints = 0, theme, className = 
           </div>
         </div>
       </div>
+
+      {currentBadge && (
+        <div className={`mb-6 p-4 rounded-2xl border flex items-center gap-3 ${
+          theme === 'dark' ? 'bg-zinc-950/60 border-amber-500/30' : 'bg-amber-50/60 border-amber-200'
+        }`}>
+          <span className="text-2xl">{currentBadge.icon}</span>
+          <div>
+            <p className="text-[10px] uppercase font-mono text-zinc-500 tracking-wider">Cari Rütbə Nişanı</p>
+            <p className={`text-sm font-bold ${currentBadge.color}`}>{currentBadge.name}</p>
+          </div>
+        </div>
+      )}
 
       {/* Next Badge Progress Banner */}
       {nextBadge && (

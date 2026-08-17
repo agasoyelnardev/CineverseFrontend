@@ -10,7 +10,17 @@ import {
 import { Book, BookReview, BookCollection, BookVsMovie, Movie, User } from '../types';
 import { BookGridSkeleton } from './SkeletonLoader';
 import LazyImage from './LazyImage';
+import FullPageOverlay from './FullPageOverlay';
 import { PdfCanvasViewer } from './PdfCanvasViewer';
+import {
+  resolvePdfUrl,
+  getDefaultPdfViewMode,
+  getGoogleViewerUrl,
+  getDirectEmbedUrl,
+  isSameOriginPdfUrl,
+} from '../utils/pdfUrl';
+import { stripHtml, truncateText, isGoogleBooksPreviewUrl } from '../utils/htmlText';
+import { getHighestBadgeForPoints } from './GamificationBadges';
 import { 
   apiGetBookCollections,
   apiCreateBookCollection,
@@ -29,8 +39,16 @@ import {
   apiUnvoteBookVsMovie,
   apiToggleBookFavorite,
   apiToggleBookWatchlist,
+  apiToggleBookLike,
+  apiToggleBookCollectionLike,
+  apiToggleSaveBookCollection,
+  apiGetBooks,
+  apiGetBookById,
   apiUpdateReadingProgress
 } from '../api';
+import { normalizeEntityId, idsInclude } from '../utils/entityIds';
+
+const BOOKS_PAGE_SIZE = 20;
 
 interface BooksSectionProps {
   books: Book[];
@@ -72,21 +90,132 @@ export default function BooksSection({
   const [selectedGenre, setSelectedGenre] = useState<string>('All');
   const [selectedLanguage, setSelectedLanguage] = useState<'All' | 'az' | 'en'>('All');
   const [activeTab, setActiveTab] = useState<'all' | 'collections' | 'vs' | 'my-lists'>('all');
+  const [displayBooks, setDisplayBooks] = useState<Book[]>([]);
+  const [booksPage, setBooksPage] = useState(1);
+  const [booksHasMore, setBooksHasMore] = useState(false);
   const [isBooksLoading, setIsBooksLoading] = useState<boolean>(false);
-
-  // Trigger brief shimmer loading state when tab or filters change
-  useEffect(() => {
-    setIsBooksLoading(true);
-    const timer = setTimeout(() => {
-      setIsBooksLoading(false);
-    }, 300);
-    return () => clearTimeout(timer);
-  }, [searchQuery, selectedGenre, selectedLanguage, activeTab]);
+  const [bookDetail, setBookDetail] = useState<any>(null);
+  const [loadingDetail, setLoadingDetail] = useState<boolean>(false);
   
   // Modals / Details State
   const [selectedBook, setSelectedBook] = useState<Book | null>(null);
   const [activeReaderBook, setActiveReaderBook] = useState<Book | null>(null);
 
+  useEffect(() => {
+    if (activeTab !== 'all') return;
+
+    let isCancelled = false;
+    setIsBooksLoading(true);
+    setBooksPage(1);
+
+    const timer = setTimeout(async () => {
+      try {
+        const response = await apiGetBooks({
+          pageNumber: 1,
+          pageSize: BOOKS_PAGE_SIZE,
+          searchTerm: searchQuery.trim() || undefined,
+          genre: selectedGenre !== 'All' ? selectedGenre : undefined,
+          language: selectedLanguage !== 'All' ? selectedLanguage : undefined,
+        });
+        if (isCancelled) return;
+
+        const backendBooks = Array.isArray(response) ? response : (response as any)?.items ?? [];
+        const mapped: Book[] = backendBooks.map((b: any) => ({
+          id: b.id,
+          title: b.title,
+          author: b.author || 'Naməlum Müəllif',
+          description: b.description || '',
+          cover: b.cover || '',
+          rating: b.rating || 0,
+          language: b.language === 'en' ? 'en' : 'az',
+          genres: b.genres || [],
+          year: b.year || new Date().getFullYear(),
+          pages: b.pages || 0,
+          reviews: [],
+          likes: b.likes || 0,
+          isLikedByCurrentUser: !!(b.isLikedByCurrentUser ?? b.IsLikedByCurrentUser),
+          movieAdaptationId: b.movieAdaptationId,
+          downloadUrl: b.downloadUrl,
+          pdfUrl: b.pdfUrl ?? b.PdfUrl,
+          customContent: b.customContent,
+          isTrending: b.isTrending,
+          isTopRated: b.isTopRated,
+          isNewRelease: b.isNewRelease,
+        }));
+        setDisplayBooks(mapped);
+        setBooksHasMore(mapped.length >= BOOKS_PAGE_SIZE);
+      } catch {
+        if (!isCancelled) setDisplayBooks([]);
+      } finally {
+        if (!isCancelled) setIsBooksLoading(false);
+      }
+    }, 350);
+
+    return () => {
+      isCancelled = true;
+      clearTimeout(timer);
+    };
+  }, [activeTab, searchQuery, selectedGenre, selectedLanguage]);
+
+  const handleLoadMoreBooks = async () => {
+    const nextPage = booksPage + 1;
+    try {
+      const response = await apiGetBooks({
+        pageNumber: nextPage,
+        pageSize: BOOKS_PAGE_SIZE,
+        searchTerm: searchQuery.trim() || undefined,
+        genre: selectedGenre !== 'All' ? selectedGenre : undefined,
+        language: selectedLanguage !== 'All' ? selectedLanguage : undefined,
+      });
+      const backendBooks = Array.isArray(response) ? response : (response as any)?.items ?? [];
+      const mapped: Book[] = backendBooks.map((b: any) => ({
+        id: b.id,
+        title: b.title,
+        author: b.author || 'Naməlum Müəllif',
+        description: b.description || '',
+        cover: b.cover || '',
+        rating: b.rating || 0,
+        language: b.language === 'en' ? 'en' : 'az',
+        genres: b.genres || [],
+        year: b.year || new Date().getFullYear(),
+        pages: b.pages || 0,
+        reviews: [],
+        likes: b.likes || 0,
+        isLikedByCurrentUser: !!(b.isLikedByCurrentUser ?? b.IsLikedByCurrentUser),
+        movieAdaptationId: b.movieAdaptationId,
+        downloadUrl: b.downloadUrl,
+        pdfUrl: b.pdfUrl,
+        customContent: b.customContent,
+        isTrending: b.isTrending,
+        isTopRated: b.isTopRated,
+        isNewRelease: b.isNewRelease,
+      }));
+      setDisplayBooks((prev) => [...prev, ...mapped]);
+      setBooksPage(nextPage);
+      setBooksHasMore(mapped.length >= BOOKS_PAGE_SIZE);
+    } catch (err) {
+      console.warn('Kitablar səhifəsi yüklənmədi:', err);
+    }
+  };
+
+useEffect(() => {
+  if (selectedBook && selectedBook.id) {
+    setLoadingDetail(true);
+    apiGetBookById(selectedBook.id)
+      .then((data) => {
+        setBookDetail(data);
+        setLoadingDetail(false);
+      })
+      .catch((err) => {
+        console.error('Backend-dən ətraflı məlumat gəlmədi:', err);
+        setLoadingDetail(false);
+      });
+  } else {
+    setBookDetail(null);
+  }
+}, [selectedBook]);
+
+  
   // Auto-open book directly in reader
   React.useEffect(() => {
     if (initialActiveReaderBookId) {
@@ -161,6 +290,44 @@ export default function BooksSection({
   // Custom Reading Lists State
   const [newListName, setNewListName] = useState('');
   const [showAddToListModal, setShowAddToListModal] = useState<Book | null>(null);
+  const [myReadingLists, setMyReadingLists] = useState<BookCollection[]>([]);
+  const [isReadingListsLoading, setIsReadingListsLoading] = useState(false);
+
+  const mapBackendBookCollection = (c: any): BookCollection => ({
+    id: c.id,
+    title: c.title || c.name || 'Kitab Kolleksiyası',
+    description: c.description || '',
+    cover: c.cover || c.coverImageUrl || 'https://images.unsplash.com/photo-1512820790803-83ca734da794?w=600&auto=format&fit=crop&q=80',
+    books: Array.isArray(c.books) ? c.books.map((b: any) => (typeof b === 'string' ? b : b.id)) : [],
+    userId: c.userId ?? c.appUserId ?? c.AppUserId,
+    author: c.author ?? c.username ?? c.Username,
+    likesCount: c.likesCount ?? c.LikesCount ?? 0,
+    isLikedByCurrentUser: !!(c.isLikedByCurrentUser ?? c.IsLikedByCurrentUser),
+    isSaved: !!(c.isSaved ?? c.IsSaved),
+  });
+
+  useEffect(() => {
+    if (!currentUser?.id) {
+      setMyReadingLists([]);
+      return;
+    }
+    let cancelled = false;
+    const loadMyReadingLists = async () => {
+      setIsReadingListsLoading(true);
+      try {
+        const colls = await apiGetUserBookCollections(currentUser.id);
+        if (!cancelled && Array.isArray(colls)) {
+          setMyReadingLists(colls.map(mapBackendBookCollection));
+        }
+      } catch (err) {
+        console.warn('Mütaliə siyahıları backend-dən yüklənə bilmədi:', err);
+      } finally {
+        if (!cancelled) setIsReadingListsLoading(false);
+      }
+    };
+    loadMyReadingLists();
+    return () => { cancelled = true; };
+  }, [currentUser?.id]);
 
   // Book Collection Modal State
   const [showCreateBookCollectionModal, setShowCreateBookCollectionModal] = useState(false);
@@ -182,7 +349,12 @@ export default function BooksSection({
             title: c.title || c.name || 'Kitab Kolleksiyası',
             description: c.description || '',
             cover: c.cover || c.coverImageUrl || 'https://images.unsplash.com/photo-1512820790803-83ca734da794?w=600&auto=format&fit=crop&q=80',
-            books: Array.isArray(c.books) ? c.books.map((b: any) => typeof b === 'string' ? b : b.id) : []
+            books: Array.isArray(c.books) ? c.books.map((b: any) => typeof b === 'string' ? b : b.id) : [],
+            userId: c.userId ?? c.appUserId ?? c.AppUserId,
+            author: c.author ?? c.username ?? c.Username,
+            likesCount: c.likesCount ?? c.LikesCount ?? 0,
+            isLikedByCurrentUser: !!(c.isLikedByCurrentUser ?? c.IsLikedByCurrentUser),
+            isSaved: !!(c.isSaved ?? c.IsSaved),
           }));
           setBookCollections(prev => {
             const existingIds = new Set(prev.map(p => p.id));
@@ -324,18 +496,9 @@ export default function BooksSection({
   const [editingBookReviewRating, setEditingBookReviewRating] = useState<number>(5);
 
   // Collect all unique genres
-  const allGenres = ['All', ...Array.from(new Set(books.flatMap(b => b.genres)))];
+  const allGenres = ['All', ...Array.from(new Set(displayBooks.flatMap(b => b.genres)))];
 
-  // Filters logic
-  const filteredBooks = books.filter(book => {
-    const matchesSearch = book.title.toLowerCase().includes(searchQuery.toLowerCase()) || 
-                          book.author.toLowerCase().includes(searchQuery.toLowerCase()) ||
-                          book.genres.some(g => g.toLowerCase().includes(searchQuery.toLowerCase()));
-    const matchesGenre = selectedGenre === 'All' || book.genres.includes(selectedGenre);
-    const matchesLang = selectedLanguage === 'All' || book.language === selectedLanguage;
-    return matchesSearch && matchesGenre && matchesLang;
-  });
-
+  const filteredBooks = displayBooks;
   const trendingBooks = filteredBooks.filter(b => b.isTrending);
   const topRatedBooks = filteredBooks.filter(b => b.isTopRated || b.rating >= 4.8);
   const newReleases = filteredBooks.filter(b => b.isNewRelease);
@@ -348,12 +511,13 @@ export default function BooksSection({
       alert('Zəhmət olmasa, əvvəlcə daxil olun!');
       return;
     }
+    const normalizedBookId = normalizeEntityId(bookId);
     const currentFavs = currentUser.favoriteBooks || [];
-    const isFav = currentFavs.includes(bookId);
+    const isFav = idsInclude(currentFavs, normalizedBookId);
     
     const updatedFavs = isFav 
-      ? currentFavs.filter(id => id !== bookId)
-      : [...currentFavs, bookId];
+      ? currentFavs.filter(id => normalizeEntityId(id) !== normalizedBookId)
+      : [...currentFavs, normalizedBookId];
 
     const updatedUser: User = {
       ...currentUser,
@@ -374,12 +538,13 @@ export default function BooksSection({
       alert('Zəhmət olmasa, əvvəlcə daxil olun!');
       return;
     }
+    const normalizedBookId = normalizeEntityId(bookId);
     const currentWatchlist = currentUser.watchlistBooks || [];
-    const isInList = currentWatchlist.includes(bookId);
+    const isInList = idsInclude(currentWatchlist, normalizedBookId);
 
     const updatedWatchlist = isInList
-      ? currentWatchlist.filter(id => id !== bookId)
-      : [...currentWatchlist, bookId];
+      ? currentWatchlist.filter(id => normalizeEntityId(id) !== normalizedBookId)
+      : [...currentWatchlist, normalizedBookId];
 
     const updatedUser: User = {
       ...currentUser,
@@ -429,8 +594,126 @@ export default function BooksSection({
     }
   };
 
-  // Custom Reading List Creator
-  const handleCreateReadingList = (e: React.FormEvent) => {
+  const handleToggleBookLike = async (bookId: string) => {
+    if (!currentUser) {
+      alert('Zəhmət olmasa, əvvəlcə daxil olun!');
+      return;
+    }
+
+    const targetBook = books.find((b) => b.id === bookId);
+    if (!targetBook) return;
+
+    const wasLiked = !!targetBook.isLikedByCurrentUser;
+    const optimisticLiked = !wasLiked;
+
+    setBooks((prev) =>
+      prev.map((b) =>
+        b.id === bookId
+          ? {
+              ...b,
+              isLikedByCurrentUser: optimisticLiked,
+              likes: Math.max(0, b.likes + (optimisticLiked ? 1 : -1)),
+            }
+          : b,
+      ),
+    );
+    if (selectedBook?.id === bookId) {
+      setSelectedBook((prev) =>
+        prev
+          ? {
+              ...prev,
+              isLikedByCurrentUser: optimisticLiked,
+              likes: Math.max(0, prev.likes + (optimisticLiked ? 1 : -1)),
+            }
+          : prev,
+      );
+    }
+
+    try {
+      const res = await apiToggleBookLike(bookId);
+      const isLiked = !!(res?.isLiked ?? (res as any)?.IsLiked);
+      setBooks((prev) => prev.map((b) => (b.id === bookId ? { ...b, isLikedByCurrentUser: isLiked } : b)));
+      if (selectedBook?.id === bookId) {
+        setSelectedBook((prev) => (prev ? { ...prev, isLikedByCurrentUser: isLiked } : prev));
+      }
+    } catch (err) {
+      setBooks((prev) =>
+        prev.map((b) =>
+          b.id === bookId
+            ? { ...b, isLikedByCurrentUser: wasLiked, likes: targetBook.likes }
+            : b,
+        ),
+      );
+      if (selectedBook?.id === bookId) {
+        setSelectedBook((prev) => (prev ? { ...prev, isLikedByCurrentUser: wasLiked, likes: targetBook.likes } : prev));
+      }
+      console.warn('Kitab bəyənməsi yenilənmədi:', err);
+    }
+  };
+
+  const handleToggleBookCollectionLike = async (colId: string) => {
+    const target = bookCollections.find((c) => c.id === colId);
+    if (!target) return;
+
+    const wasLiked = !!target.isLikedByCurrentUser;
+    const optimisticLiked = !wasLiked;
+    const previousCount = target.likesCount ?? 0;
+
+    const applyUpdate = (liked: boolean, count: number) => {
+      setBookCollections((prev) =>
+        prev.map((c) =>
+          c.id === colId ? { ...c, isLikedByCurrentUser: liked, likesCount: count } : c,
+        ),
+      );
+      if (selectedBookCollection?.id === colId) {
+        setSelectedBookCollection((prev) =>
+          prev ? { ...prev, isLikedByCurrentUser: liked, likesCount: count } : prev,
+        );
+      }
+    };
+
+    applyUpdate(optimisticLiked, Math.max(0, previousCount + (optimisticLiked ? 1 : -1)));
+
+    try {
+      const res = await apiToggleBookCollectionLike(colId);
+      const isLiked = !!(res?.isLiked ?? (res as any)?.IsLiked);
+      applyUpdate(isLiked, Math.max(0, previousCount + (isLiked && !wasLiked ? 1 : !isLiked && wasLiked ? -1 : 0)));
+    } catch (err) {
+      applyUpdate(wasLiked, previousCount);
+      console.warn('Kolleksiya bəyənməsi yenilənmədi:', err);
+    }
+  };
+
+  const handleToggleSaveBookCollection = async (colId: string) => {
+    const target = bookCollections.find((c) => c.id === colId);
+    if (!target) return;
+
+    const wasSaved = !!target.isSaved;
+    const optimisticSaved = !wasSaved;
+
+    const applyUpdate = (saved: boolean) => {
+      setBookCollections((prev) =>
+        prev.map((c) => (c.id === colId ? { ...c, isSaved: saved } : c)),
+      );
+      if (selectedBookCollection?.id === colId) {
+        setSelectedBookCollection((prev) => (prev ? { ...prev, isSaved: saved } : prev));
+      }
+    };
+
+    applyUpdate(optimisticSaved);
+
+    try {
+      const res = await apiToggleSaveBookCollection(colId);
+      const isSaved = !!(res?.isSaved ?? (res as any)?.IsSaved);
+      applyUpdate(isSaved);
+    } catch (err) {
+      applyUpdate(wasSaved);
+      console.warn('Kolleksiya saxlama yenilənmədi:', err);
+    }
+  };
+
+  // Custom Reading List Creator (backend BookCollections)
+  const handleCreateReadingList = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!currentUser) {
       alert('Zəhmət olmasa, əvvəlcə daxil olun!');
@@ -438,75 +721,95 @@ export default function BooksSection({
     }
     if (!newListName.trim()) return;
 
-    const currentLists = currentUser.readingLists || [];
-    const newList = {
-      id: 'rl_' + Date.now(),
-      name: newListName.trim(),
-      books: []
+    const title = newListName.trim();
+    const tempId = 'rl_' + Date.now();
+    const optimisticList: BookCollection = {
+      id: tempId,
+      title,
+      description: 'Şəxsi mütaliə siyahısı',
+      cover: 'https://images.unsplash.com/photo-1512820790803-83ca734da794?w=600&auto=format&fit=crop&q=80',
+      books: [],
+      userId: currentUser.id,
     };
 
-    const updatedUser: User = {
-      ...currentUser,
-      readingLists: [...currentLists, newList]
-    };
-    setCurrentUser(updatedUser);
+    setMyReadingLists((prev) => [optimisticList, ...prev]);
     setNewListName('');
-  };
 
-  const handleAddBookToReadingList = (listId: string, bookId: string) => {
-    if (!currentUser) return;
-    const currentLists = currentUser.readingLists || [];
-    
-    const updatedLists = currentLists.map(list => {
-      if (list.id === listId) {
-        if (list.books.includes(bookId)) {
-          alert('Bu kitab artıq siyahıda var!');
-          return list;
-        }
-        return {
-          ...list,
-          books: [...list.books, bookId]
-        };
+    try {
+      const res: any = await apiCreateBookCollection({
+        title,
+        description: optimisticList.description,
+        cover: optimisticList.cover,
+      });
+      const returnedId = (typeof res === 'string' ? res : res?.id || res?.result) || tempId;
+      if (returnedId !== tempId) {
+        setMyReadingLists((prev) => prev.map((list) => (list.id === tempId ? { ...list, id: returnedId } : list)));
       }
-      return list;
-    });
-
-    setCurrentUser({
-      ...currentUser,
-      readingLists: updatedLists
-    });
-    setShowAddToListModal(null);
-  };
-
-  const handleDeleteReadingList = (listId: string) => {
-    if (!currentUser) return;
-    if (window.confirm('Bu mütaliə siyahısını silmək istədiyinizdən əminsiniz?')) {
-      const currentLists = currentUser.readingLists || [];
-      const updatedUser: User = {
-        ...currentUser,
-        readingLists: currentLists.filter(l => l.id !== listId)
-      };
-      setCurrentUser(updatedUser);
+    } catch (err) {
+      setMyReadingLists((prev) => prev.filter((list) => list.id !== tempId));
+      console.error('Mütaliə siyahısı yaradıla bilmədi:', err);
+      alert('Siyahı yaradılarkən xəta baş verdi.');
     }
   };
 
-  const handleRemoveBookFromList = (listId: string, bookId: string) => {
+  const handleAddBookToReadingList = async (listId: string, bookId: string) => {
     if (!currentUser) return;
-    const currentLists = currentUser.readingLists || [];
-    const updatedLists = currentLists.map(list => {
-      if (list.id === listId) {
-        return {
-          ...list,
-          books: list.books.filter(id => id !== bookId)
-        };
-      }
-      return list;
-    });
+    const targetList = myReadingLists.find((list) => list.id === listId);
+    if (!targetList) return;
+    if (targetList.books.includes(bookId)) {
+      alert('Bu kitab artıq siyahıda var!');
+      return;
+    }
 
-    setCurrentUser({
-      ...currentUser,
-      readingLists: updatedLists
-    });
+    setMyReadingLists((prev) =>
+      prev.map((list) =>
+        list.id === listId ? { ...list, books: [...list.books, bookId] } : list
+      )
+    );
+    setShowAddToListModal(null);
+
+    try {
+      await apiAddBookToCollection(listId, bookId);
+    } catch (err) {
+      setMyReadingLists((prev) =>
+        prev.map((list) =>
+          list.id === listId ? { ...list, books: list.books.filter((id) => id !== bookId) } : list
+        )
+      );
+      console.warn('Kitab siyahıya əlavə olunmadı:', err);
+    }
+  };
+
+  const handleDeleteReadingList = async (listId: string) => {
+    if (!currentUser) return;
+    if (!window.confirm('Bu mütaliə siyahısını silmək istədiyinizdən əminsiniz?')) return;
+
+    const previous = myReadingLists;
+    setMyReadingLists((prev) => prev.filter((list) => list.id !== listId));
+
+    try {
+      await apiDeleteBookCollection(listId);
+    } catch (err) {
+      setMyReadingLists(previous);
+      console.warn('Mütaliə siyahısı silinmədi:', err);
+    }
+  };
+
+  const handleRemoveBookFromList = async (listId: string, bookId: string) => {
+    if (!currentUser) return;
+    const previous = myReadingLists;
+    setMyReadingLists((prev) =>
+      prev.map((list) =>
+        list.id === listId ? { ...list, books: list.books.filter((id) => id !== bookId) } : list
+      )
+    );
+
+    try {
+      await apiRemoveBookFromCollection(listId, bookId);
+    } catch (err) {
+      setMyReadingLists(previous);
+      console.warn('Kitab siyahıdan çıxarılmadı:', err);
+    }
   };
 
   // Submit Book Review
@@ -796,7 +1099,7 @@ export default function BooksSection({
   };
 
   const renderBookCard = (book: Book, index: number = 0) => {
-    const isFav = currentUser?.favoriteBooks?.includes(book.id);
+    const isFav = idsInclude(currentUser?.favoriteBooks, book.id);
     const progress = currentUser?.readingProgress?.[book.id] || 0;
 
     return (
@@ -867,7 +1170,7 @@ export default function BooksSection({
               <Heart className={`w-3.5 h-3.5 ${isFav ? 'fill-current' : ''}`} />
             </button>
             {(() => {
-              const isInWatchlist = currentUser?.watchlistBooks?.includes(book.id);
+              const isInWatchlist = idsInclude(currentUser?.watchlistBooks, book.id);
               return (
                 <button 
                   onClick={(e) => {
@@ -1109,15 +1412,15 @@ export default function BooksSection({
               </div>
             )}
 
-            {/* Reading Lists Section */}
+            {/* Reading Lists Section (user book collections) */}
             <div className="space-y-2">
               <span className="text-[10px] font-black uppercase text-zinc-400 tracking-wider">Şəxsi Mütaliə Siyahıları</span>
-              {(!currentUser || !currentUser.readingLists || currentUser.readingLists.length === 0) ? (
+              {myReadingLists.length === 0 ? (
                 <div className="p-4 text-center border border-dashed rounded-xl border-zinc-700/50">
                   <p className="text-xs text-zinc-500 italic">Hələ heç bir mütaliə siyahınız yoxdur.</p>
                 </div>
               ) : (
-                currentUser.readingLists.map(list => (
+                myReadingLists.map(list => (
                   <button
                     key={list.id}
                     onClick={() => handleAddBookToReadingList(list.id, showAddToListModal.id)}
@@ -1127,7 +1430,7 @@ export default function BooksSection({
                         : 'bg-zinc-50 border-zinc-200 hover:bg-zinc-100 hover:border-red-500/20'
                     }`}
                   >
-                    <span className="font-extrabold">{list.name}</span>
+                    <span className="font-extrabold">{list.title}</span>
                     <ChevronRight className="w-4 h-4 text-zinc-500" />
                   </button>
                 ))
@@ -1153,6 +1456,17 @@ export default function BooksSection({
   }
 
   if (selectedBook) {
+  // Əgər məlumat yüklənirsə VƏ YA backend-dən bookDetail məlumatı hələ tam gəlib çatmayıbsa, gözləmə ekranı göstər
+  if (loadingDetail || !bookDetail) {
+    return (
+      <div className="flex flex-col items-center justify-center min-h-screen bg-zinc-950 text-white space-y-4">
+        <div className="w-8 h-8 border-4 border-red-600 border-t-transparent rounded-full animate-spin"></div>
+        <p className="text-sm font-medium text-zinc-400">Kitab məlumatları backenddən çəkilir...</p>
+      </div>
+    );
+  }
+
+
     return (
       <div className="space-y-6 pb-12 animate-fade-in">
         {/* Top Back Navigation Bar */}
@@ -1174,57 +1488,80 @@ export default function BooksSection({
         </div>
 
         {/* Book Details Full View Layout */}
-        <div className={`w-full rounded-3xl border shadow-xl relative overflow-hidden flex flex-col ${
-          theme === 'dark' ? 'bg-zinc-950 border-zinc-800 text-white shadow-black/60' : 'bg-white border-zinc-200 text-zinc-900 shadow-zinc-200/50'
+        <div className={`w-full rounded-2xl border shadow-lg relative overflow-hidden ${
+          theme === 'dark' ? 'bg-zinc-950 border-zinc-800 text-white shadow-black/40' : 'bg-white border-zinc-200 text-zinc-900 shadow-zinc-200/50'
         }`}>
-          {/* Cover background blur */}
-          <div className="absolute top-0 left-0 w-full h-48 sm:h-56 bg-zinc-950 overflow-hidden opacity-25 pointer-events-none">
+          <div className="absolute top-0 left-0 w-full h-28 bg-zinc-950 overflow-hidden opacity-20 pointer-events-none">
             <img src={selectedBook.cover} alt="" className="w-full h-full object-cover blur-xl" />
           </div>
 
-          <div className="p-6 sm:p-8 space-y-8 relative z-10">
-            <div className="flex flex-col md:flex-row gap-6 lg:gap-8 items-start">
-              {/* Cover Poster */}
-              <div className="w-40 sm:w-48 aspect-[2/3] bg-zinc-900 rounded-2xl overflow-hidden border border-zinc-800 shrink-0 mx-auto md:mx-0 shadow-2xl relative">
+          <div className="p-4 sm:p-5 space-y-4 relative z-10">
+            <div className="flex flex-col sm:flex-row gap-4 items-start">
+              <div className="w-28 sm:w-32 aspect-[2/3] bg-zinc-900 rounded-xl overflow-hidden border border-zinc-800 shrink-0 mx-auto sm:mx-0 shadow-lg relative">
                 <img src={selectedBook.cover} alt={selectedBook.title} className="w-full h-full object-cover" />
-                <span className="absolute top-3 left-3 px-2.5 py-1 bg-red-600 text-white text-[9px] font-black uppercase rounded-lg shadow">
+                <span className="absolute top-2 left-2 px-2 py-0.5 bg-red-600 text-white text-[8px] font-black uppercase rounded-md shadow">
                   {selectedBook.language}
                 </span>
               </div>
 
-              {/* Main Information */}
-              <div className="flex-1 space-y-4 text-center md:text-left">
-                <div className="space-y-2">
-                  <div className="flex items-center justify-center md:justify-start gap-2 flex-wrap">
-                    <span className={`px-3 py-1 text-[9px] font-black tracking-wider uppercase rounded-full ${
+              <div className="flex-1 space-y-3 text-center sm:text-left min-w-0">
+                <div className="space-y-1.5">
+                  <div className="flex items-center justify-center sm:justify-start gap-2 flex-wrap">
+                    <span className={`px-2.5 py-0.5 text-[9px] font-black tracking-wider uppercase rounded-full ${
                       theme === 'dark' ? 'bg-zinc-900 text-zinc-400 border border-zinc-800' : 'bg-zinc-100 text-zinc-500 border border-zinc-200'
                     }`}>
                       İl: {selectedBook.year}
                     </span>
-                    <span className={`px-3 py-1 text-[9px] font-black tracking-wider uppercase rounded-full ${
+                    <span className={`px-2.5 py-0.5 text-[9px] font-black tracking-wider uppercase rounded-full ${
                       theme === 'dark' ? 'bg-zinc-900 text-zinc-400 border border-zinc-800' : 'bg-zinc-100 text-zinc-500 border border-zinc-200'
                     }`}>
                       Səhifə: {selectedBook.pages} s.
                     </span>
+                    {selectedBook.pdfUrl ? (
+                      <span className="px-2.5 py-0.5 text-[9px] font-black uppercase rounded-full bg-emerald-500/15 text-emerald-400 border border-emerald-500/30">
+                        PDF mövcuddur
+                      </span>
+                    ) : selectedBook.downloadUrl && isGoogleBooksPreviewUrl(selectedBook.downloadUrl) ? (
+                      <span className="px-2.5 py-0.5 text-[9px] font-black uppercase rounded-full bg-amber-500/15 text-amber-400 border border-amber-500/30">
+                        Google ön baxış
+                      </span>
+                    ) : (
+                      <span className="px-2.5 py-0.5 text-[9px] font-black uppercase rounded-full bg-zinc-800/80 text-zinc-400 border border-zinc-700">
+                        Tam mətn yoxdur
+                      </span>
+                    )}
                   </div>
-                  <h1 className="text-2xl sm:text-4xl font-black font-display tracking-tight leading-tight">{selectedBook.title}</h1>
-                  <p className="text-sm font-bold text-zinc-500 font-mono">Müəllif: <span className="text-red-500">{selectedBook.author}</span></p>
+                  <h1 className="text-xl sm:text-2xl font-black font-display tracking-tight leading-tight">{selectedBook.title}</h1>
+                  <p className="text-xs font-bold text-zinc-500 font-mono">Müəllif: <span className="text-red-500">{selectedBook.author}</span></p>
                 </div>
 
-                <p className={`text-sm leading-relaxed max-w-3xl ${theme === 'dark' ? 'text-zinc-300' : 'text-zinc-700'}`}>
-                  {selectedBook.description}
+                <p className={`text-sm leading-relaxed line-clamp-5 ${theme === 'dark' ? 'text-zinc-300' : 'text-zinc-700'}`}>
+                  {truncateText(stripHtml(selectedBook.description) || 'Bu kitab üçün təsvir əlavə edilməyib.', 520)}
                 </p>
 
-                {/* Primary E-Reader Action */}
-                <div className="pt-2 flex flex-col sm:flex-row gap-3 justify-center md:justify-start">
+                <div className="pt-1 flex flex-col sm:flex-row gap-2.5 justify-center sm:justify-start">
                   <button
                     onClick={() => {
                       setActiveReaderBook(selectedBook);
                     }}
-                    className="py-3 px-6 bg-gradient-to-r from-red-600 to-amber-500 hover:from-red-500 hover:to-amber-400 text-white text-xs font-black uppercase tracking-wider rounded-xl transition duration-200 cursor-pointer flex items-center justify-center gap-2 shadow-lg shadow-red-600/20 hover:scale-[1.02] active:scale-[0.98]"
+                    className="py-2.5 px-5 bg-gradient-to-r from-red-600 to-amber-500 hover:from-red-500 hover:to-amber-400 text-white text-xs font-black uppercase tracking-wider rounded-xl transition duration-200 cursor-pointer flex items-center justify-center gap-2 shadow-lg shadow-red-600/20"
                   >
-                    <BookOpen className="w-4 h-4" /> Kitabı Oxu (PDF / E-Reader)
+                    <BookOpen className="w-4 h-4" /> {selectedBook.pdfUrl ? 'Kitabı Oxu (PDF)' : 'Oxuma Rejimini Aç'}
                   </button>
+                  {selectedBook.downloadUrl && isGoogleBooksPreviewUrl(selectedBook.downloadUrl) && (
+                    <a
+                      href={selectedBook.downloadUrl}
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      className={`py-2.5 px-5 text-xs font-black uppercase tracking-wider rounded-xl transition duration-200 flex items-center justify-center gap-2 border ${
+                        theme === 'dark'
+                          ? 'border-zinc-700 text-zinc-200 hover:bg-zinc-900'
+                          : 'border-zinc-200 text-zinc-700 hover:bg-zinc-50'
+                      }`}
+                    >
+                      Google Books ↗
+                    </a>
+                  )}
                 </div>
 
                 <div className="flex flex-wrap gap-2 justify-center md:justify-start pt-2">
@@ -1243,9 +1580,16 @@ export default function BooksSection({
                     <Star className="w-4 h-4 fill-current" /> {selectedBook.rating} / 5
                   </span>
                   <span className="text-zinc-500">•</span>
-                  <span className="flex items-center gap-1.5 text-zinc-500">
-                    <ThumbsUp className="w-4 h-4" /> {selectedBook.likes} bəyənmə
-                  </span>
+                  <button
+                    type="button"
+                    onClick={() => handleToggleBookLike(selectedBook.id)}
+                    className={`flex items-center gap-1.5 transition hover:scale-105 cursor-pointer ${
+                      selectedBook.isLikedByCurrentUser ? 'text-red-500' : 'text-zinc-500'
+                    }`}
+                  >
+                    <ThumbsUp className={`w-4 h-4 ${selectedBook.isLikedByCurrentUser ? 'fill-current' : ''}`} />
+                    {selectedBook.likes} bəyənmə
+                  </button>
                 </div>
 
                 {/* Movie Adaption Banner */}
@@ -1628,6 +1972,17 @@ export default function BooksSection({
                   <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5 gap-4">
                     {filteredBooks.map(renderBookCard)}
                   </div>
+                  {booksHasMore && !isBooksLoading && (
+                    <div className="flex justify-center pt-2">
+                      <button
+                        type="button"
+                        onClick={handleLoadMoreBooks}
+                        className="px-6 py-2.5 bg-red-600 hover:bg-red-500 text-white text-xs font-bold rounded-xl transition cursor-pointer"
+                      >
+                        Daha çox kitab yüklə
+                      </button>
+                    </div>
+                  )}
                 </div>
               )}
             </div>
@@ -1701,12 +2056,40 @@ export default function BooksSection({
                 <div className="p-5 space-y-4">
                   <div className="flex items-center justify-between text-[10px] text-zinc-500 font-bold">
                     <span>Kitab sayı: {colBooks.length} ədəd</span>
-                    {col.author && (
-                      <span className="text-[9px] text-zinc-400 font-normal truncate max-w-[120px]">
-                        Yaradan: {col.author}
-                      </span>
-                    )}
+                    <div className="flex items-center gap-2">
+                      <button
+                        type="button"
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          handleToggleBookCollectionLike(col.id);
+                        }}
+                        className={`flex items-center gap-1 transition cursor-pointer ${
+                          col.isLikedByCurrentUser ? 'text-red-500' : 'text-zinc-500 hover:text-red-400'
+                        }`}
+                      >
+                        <Heart className={`w-3.5 h-3.5 ${col.isLikedByCurrentUser ? 'fill-current' : ''}`} />
+                        {col.likesCount ?? 0}
+                      </button>
+                      <button
+                        type="button"
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          handleToggleSaveBookCollection(col.id);
+                        }}
+                        className={`transition cursor-pointer ${
+                          col.isSaved ? 'text-amber-500' : 'text-zinc-500 hover:text-amber-400'
+                        }`}
+                        title={col.isSaved ? 'Saxlanılıb' : 'Saxla'}
+                      >
+                        <Bookmark className={`w-3.5 h-3.5 ${col.isSaved ? 'fill-current' : ''}`} />
+                      </button>
+                    </div>
                   </div>
+                  {col.author && (
+                    <span className="text-[9px] text-zinc-400 font-normal truncate block">
+                      Yaradan: {col.author}
+                    </span>
+                  )}
                   
                   {/* Book list in collection */}
                   <div className="space-y-2">
@@ -1890,7 +2273,9 @@ export default function BooksSection({
               </form>
 
               {/* Lists Grid */}
-              {(!currentUser.readingLists || currentUser.readingLists.length === 0) ? (
+              {isReadingListsLoading ? (
+                <div className="text-center py-12 text-xs text-zinc-500">Mütaliə siyahıları yüklənir...</div>
+              ) : myReadingLists.length === 0 ? (
                 <div className="text-center py-12 space-y-1">
                   <BookOpen className="w-10 h-10 text-zinc-600 mx-auto" />
                   <h4 className="text-xs font-bold">Hələ heç bir siyahınız yoxdur</h4>
@@ -1898,7 +2283,7 @@ export default function BooksSection({
                 </div>
               ) : (
                 <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
-                  {currentUser.readingLists.map(list => {
+                  {myReadingLists.map(list => {
                     const listBooks = books.filter(b => list.books.includes(b.id));
 
                     return (
@@ -1910,7 +2295,7 @@ export default function BooksSection({
                       >
                         <div className="flex items-center justify-between">
                           <div>
-                            <h4 className="text-sm font-black tracking-tight">{list.name}</h4>
+                            <h4 className="text-sm font-black tracking-tight">{list.title}</h4>
                             <p className="text-[10px] text-zinc-500">Kitabların sayı: {listBooks.length}</p>
                           </div>
                           <button
@@ -1976,9 +2361,9 @@ export default function BooksSection({
 
       {/* CREATE BOOK COLLECTION FULL PAGE VIEW */}
       {showCreateBookCollectionModal && (
-        <div className="fixed inset-0 z-[100] bg-zinc-950 text-white overflow-y-auto animate-fade-in flex flex-col">
+        <FullPageOverlay className="bg-zinc-950 text-white animate-fade-in">
           {/* Top Header Navigation */}
-          <header className="sticky top-0 z-20 px-6 py-4 bg-zinc-900/90 backdrop-blur-md border-b border-zinc-800 flex items-center justify-between">
+          <header className="sticky top-0 z-20 px-6 py-4 bg-zinc-900/90 backdrop-blur-md border-b border-zinc-800 flex items-center justify-between shrink-0">
             <button
               type="button"
               onClick={() => setShowCreateBookCollectionModal(false)}
@@ -2087,7 +2472,7 @@ export default function BooksSection({
                     Kolleksiyaya daxil etmək istədiyiniz kitabların yanında quş işarəsi qoyun:
                   </p>
 
-                  <div className="flex-1 max-h-[360px] overflow-y-auto p-2 rounded-2xl bg-zinc-950 border border-zinc-800 space-y-2">
+                  <div className="flex-1 min-h-[320px] max-h-[calc(100vh-22rem)] overflow-y-auto p-2 rounded-2xl bg-zinc-950 border border-zinc-800 space-y-2">
                     {books.length === 0 ? (
                       <p className="text-[11px] text-zinc-500 p-4 text-center">Mövcud kitab yoxdur</p>
                     ) : (
@@ -2143,7 +2528,7 @@ export default function BooksSection({
               </div>
             </form>
           </main>
-        </div>
+        </FullPageOverlay>
       )}
 
       {/* SELECTED BOOK COLLECTION DETAIL FULL PAGE VIEW */}
@@ -2154,9 +2539,9 @@ export default function BooksSection({
         const colBooksIds = Array.isArray(selectedBookCollection.books) ? selectedBookCollection.books : [];
 
         return (
-          <div className="fixed inset-0 z-[100] bg-zinc-950 text-white overflow-y-auto animate-fade-in flex flex-col">
+          <FullPageOverlay className="bg-zinc-950 text-white animate-fade-in">
             {/* Navigation Header */}
-            <header className="sticky top-0 z-20 px-6 py-4 bg-zinc-900/90 backdrop-blur-md border-b border-zinc-800 flex items-center justify-between">
+            <header className="sticky top-0 z-20 px-6 py-4 bg-zinc-900/90 backdrop-blur-md border-b border-zinc-800 flex items-center justify-between shrink-0">
               <button
                 type="button"
                 onClick={() => setSelectedBookCollection(null)}
@@ -2191,6 +2576,32 @@ export default function BooksSection({
                   <p className="text-xs sm:text-sm text-zinc-300 max-w-2xl leading-relaxed">
                     {selectedBookCollection.description}
                   </p>
+                  <div className="flex items-center gap-3 pt-1">
+                    <button
+                      type="button"
+                      onClick={() => handleToggleBookCollectionLike(selectedBookCollection.id)}
+                      className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-bold border transition cursor-pointer ${
+                        selectedBookCollection.isLikedByCurrentUser
+                          ? 'bg-red-600/20 border-red-500/40 text-red-400'
+                          : 'bg-black/40 border-zinc-700 text-zinc-300 hover:border-red-500/40'
+                      }`}
+                    >
+                      <Heart className={`w-3.5 h-3.5 ${selectedBookCollection.isLikedByCurrentUser ? 'fill-current' : ''}`} />
+                      {selectedBookCollection.likesCount ?? 0} bəyənmə
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => handleToggleSaveBookCollection(selectedBookCollection.id)}
+                      className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-bold border transition cursor-pointer ${
+                        selectedBookCollection.isSaved
+                          ? 'bg-amber-600/20 border-amber-500/40 text-amber-400'
+                          : 'bg-black/40 border-zinc-700 text-zinc-300 hover:border-amber-500/40'
+                      }`}
+                    >
+                      <Bookmark className={`w-3.5 h-3.5 ${selectedBookCollection.isSaved ? 'fill-current' : ''}`} />
+                      {selectedBookCollection.isSaved ? 'Saxlanılıb' : 'Saxla'}
+                    </button>
+                  </div>
                 </div>
               </div>
 
@@ -2312,7 +2723,7 @@ export default function BooksSection({
                 </button>
               </div>
             </main>
-          </div>
+          </FullPageOverlay>
         );
       })()}
 
@@ -2328,7 +2739,7 @@ export function getBookChapters(book: Book): { title: string; pages: string[] }[
   const isEn = book.language === 'en';
 
   if (book.customContent) {
-    const content = book.customContent;
+    const content = stripHtml(book.customContent);
     const paragraphs = content.split('\n\n').map(p => p.trim()).filter(Boolean);
     const pages: string[] = [];
     let currentPageText = '';
@@ -2477,67 +2888,48 @@ export function getBookChapters(book: Book): { title: string; pages: string[] }[
       }
     ];
   } else {
-    // Dynamic rich e-book generator for newly added or imported books
-    const totalBookPages = book.pages || 250;
-    const desc = book.description || `${book.author} tərəfindən qələmə alınmış "${book.title}" əsəri oxuculara dərin fəlsəfi təcrübə yaşadır.`;
+    const cleanDesc = stripHtml(book.description);
+    const totalBookPages = book.pages || 0;
+
+    if (book.downloadUrl && isGoogleBooksPreviewUrl(book.downloadUrl)) {
+      return [
+        {
+          title: isEn ? 'Google Books Preview' : 'Google Books Ön Baxış',
+          pages: [
+            isEn
+              ? `"${book.title}" by ${book.author} was imported from Google Books. The full text is not stored on CineVerse yet.\n\n${truncateText(cleanDesc || 'No description available.', 700)}`
+              : `"${book.title}" (${book.author}) Google Books-dan idxal edilib. Tam mətn hələ platformada yoxdur.\n\n${truncateText(cleanDesc || 'Kitab haqqında qısa məlumat yoxdur.', 700)}`,
+            isEn
+              ? 'Use the preview panel or open Google Books in a new tab. An admin can upload a PDF for full in-app reading.'
+              : 'Ön baxış panelindən istifadə edin və ya Google Books linkini açın. Admin PDF yükləyərsə tam oxuma aktiv olacaq.',
+          ],
+        },
+      ];
+    }
+
+    if (cleanDesc) {
+      return [
+        {
+          title: isEn ? `About ${book.title}` : `${book.title} haqqında`,
+          pages: [
+            `${isEn ? 'Author' : 'Müəllif'}: ${book.author}\n${isEn ? 'Year' : 'İl'}: ${book.year || '—'}\n${isEn ? 'Pages' : 'Səhifə'}: ${totalBookPages || '—'}\n\n${truncateText(cleanDesc, 900)}`,
+            isEn
+              ? 'The full book text is not available in CineVerse yet. Upload a PDF via the admin panel to enable reading mode.'
+              : 'Kitabın tam mətni hələ platformada yoxdur. Oxuma rejimi üçün admin panelindən PDF yükləyin.',
+          ],
+        },
+      ];
+    }
 
     return [
       {
-        title: `I Fəsil: Giriş və Mühit (${book.title})`,
+        title: isEn ? 'Content unavailable' : 'Məzmun mövcud deyil',
         pages: [
-          `Siz hazırda ${book.author} tərəfindən yazılmış "${book.title}" əsərini mütaliə edirsiniz. Bu kitab ümumilikdə ${totalBookPages} səhifədən ibarətdir və ${book.year || '2024'}-cü ildə nəşr edilmişdir.\n\n${desc}`,
-          `Süjet xəttinin ilk addımlarında oxucu qəhrəmanların daxili dünyası və onları əhatə edən mühitlə yaxından tanış olur. Müəllif ${book.author} təsvir etdiyi hər bir səhnədə incə detallara xüsusi diqqət yetirərək canlı mənzərə yaradır.`
-        ]
+          isEn
+            ? 'No PDF or full text has been added for this book yet. Please upload a PDF from the admin panel.'
+            : 'Bu kitab üçün hələ PDF və ya tam mətn əlavə edilməyib. Admin panelindən PDF yükləyin.',
+        ],
       },
-      {
-        title: `II Fəsil: İlk Düyünlər və Ziddiyyət`,
-        pages: [
-          `Hadisələr inkişaf etdikcə baş qəhrəman gözlənilməz ziddiyyətlərlə qarşılaşır. Qərarlar vermək məcburiyyəti onun daxili aləmində böyük fırtınalar qoparır. Çətin seçim qarşısında qalan obraz öz prinsiplərini sınayır.`,
-          `Bu fəsildə əsərin köməkçi obrazları da səhnəyə daxil olur. Onların hər biri baş qəhrəmanın dünyagörüşünə və atdığı addımlara birbaşa təsir göstərir. Təsvirlər gərginliyi daha da artırır.`
-        ]
-      },
-      {
-        title: `III Fəsil: Səyahət və Gizli Həqiqətlər`,
-        pages: [
-          `Qəhrəman yeni bir səyahətə çıxır. Bu fiziki səyahətlə yanaşı, həm də mənəvi bir axtarışdır. Yol boyunca qarşılaşdığı insanlar ona həyatın fərqli üzlərini göstərir və unudulmuş həqiqətləri xatırladır.`,
-          `Müəllifin fəlsəfi fikirləri bu səhifələrdə daha da dərinləşir. Həyatın mənası, zamanın axışı və insan münasibətləri haqqında deyilən hər bir fikir oxucunu dərindən düşündürür.`
-        ]
-      },
-      {
-        title: `IV Fəsil: Sınaq və Dözümlülük`,
-        pages: [
-          `Taleyin kəskin dönüşləri baş verir. Qəhrəmanın inandığı dəyərlər sarsılır və o, gözlənilməz bir xəyanətlə və ya çətin maneə ilə üzbəüz qalır. Burada yalnız möhkəm iradəyə malik olanlar ayaqda qala bilər.`,
-          `Gərginlik pik həddə çatır. Qaranlıq məqamlarda ümid işığı axtaran qəhrəman öz daxili gücünü kəşf edir. Bu sınaq onun xarakterini tamamilə yenidən formalaşdırır.`
-        ]
-      },
-      {
-        title: `V Fəsil: Mənəvi Axtarışlar və Dialoqlar`,
-        pages: [
-          `Fəslin mərkəzində dərin fəlsəfi dialoqlar dayanır. İki fərqli dünyagörüşün toqquşması həqiqətin axtarışı ilə nəticələnir. Müəllif oxucuya tərəf tutmadan müstəqil mühakimə yürütmək imkanı verir.`,
-          `Daxili sakitlik və dinclik axtarışı davam edir. Qəhrəman keçmişdə etdiyi səhvləri təhlil edir və gələcəyə doğru daha təmkinli addım atmağa qərar verir.`
-        ]
-      },
-      {
-        title: `VI Fəsil: Dönüş Nöqtəsi`,
-        pages: [
-          `Süjetin ən mühüm dönüş nöqtələrindən biri baş verir. Bütün gizli qalan sirlər üzə çıxır və obrazlar öz həqiqi simalarını göstərirlər. Bu məqam əsərin axarını tamamilə dəyişir.`,
-          `Oxucu üçün gərgin və həyəcanlı anlar başlayır. Hər bir cümlə növbəti səhifədə nə baş verəcəyini səbirsizliklə gözləməyə vadar edir.`
-        ]
-      },
-      {
-        title: `VII Fəsil: Kulminasiya Nöqtəsi`,
-        pages: [
-          `Hadisələrin zirvə nöqtəsi – kulminasiya. Bütün ziddiyyətlər, münaqişələr və gözləntilər bu fəsildə toqquşur. İradə, cəsarət və fədakarlıq imtahanı keçirilir.`,
-          `Böyük qərar verilir. Bu qərar təkcə baş qəhrəmanın deyil, onun ətrafındakı hər kəsin gələcək taleyini müəyyən edir.`
-        ]
-      },
-      {
-        title: `VIII Fəsil: Nəticə və Həyat Dərsləri`,
-        pages: [
-          `Tufandan sonra sakitlik çökür. Dünyanın və insan ruhunun bərpası prosesi başlayır. Zərər çəkmiş hisslər sağalır, yeni ümidlər cücərir.`,
-          `Mütaliənizi tamamladığınız üçün təbrik edirik! "${book.title}" əsəri haqqında öz rəy və təəssüratlarınızı CineVerse kitabxana bölməsində paylaşaraq digər oxuculara tövsiyə edə bilərsiniz.`
-        ]
-      }
     ];
   }
 }
@@ -2559,6 +2951,55 @@ interface NoteItem {
   comment: string;
   pageIndex: number;
   date: string;
+}
+
+function getBookNotesStorageKey(userId: string, bookId: string) {
+  return `cineverse_notes_${userId}_${bookId}`;
+}
+
+function getBookBookmarksStorageKey(userId: string, bookId: string) {
+  return `cineverse_bookmarks_${userId}_${bookId}`;
+}
+
+function loadStoredNotes(userId: string | undefined, bookId: string): NoteItem[] {
+  if (!userId) return [];
+  try {
+    const key = getBookNotesStorageKey(userId, bookId);
+    let saved = localStorage.getItem(key);
+    if (!saved) {
+      const legacyKey = `cineverse_notes_${bookId}`;
+      const legacy = localStorage.getItem(legacyKey);
+      if (legacy) {
+        localStorage.setItem(key, legacy);
+        localStorage.removeItem(legacyKey);
+        saved = legacy;
+      }
+    }
+    return saved ? JSON.parse(saved) : [];
+  } catch {
+    return [];
+  }
+}
+
+function loadStoredBookmarks(userId: string | undefined, bookId: string): number[] {
+  if (!userId) return [];
+  try {
+    const key = getBookBookmarksStorageKey(userId, bookId);
+    let saved = localStorage.getItem(key);
+    if (!saved) {
+      const legacyKey = `cineverse_bookmarks_${bookId}`;
+      const legacy = localStorage.getItem(legacyKey);
+      if (legacy) {
+        localStorage.setItem(key, legacy);
+        localStorage.removeItem(legacyKey);
+        saved = legacy;
+      }
+    }
+    const parsed = saved ? JSON.parse(saved) : [];
+    return Array.isArray(parsed) ? parsed : [];
+  } catch {
+    return [];
+  }
 }
 
 export function BookReader({ book, onClose, theme, currentUser, setCurrentUser }: BookReaderProps) {
@@ -2592,38 +3033,42 @@ export function BookReader({ book, onClose, theme, currentUser, setCurrentUser }
   const [fontSize, setFontSize] = useState<number>(16);
   const [fontStyle, setFontStyle] = useState<'serif' | 'sans' | 'mono'>('serif');
   const [layoutMode, setLayoutMode] = useState<'book' | 'pdf'>('book');
-  const [embedViewMode, setEmbedViewMode] = useState<'google' | 'direct' | 'text'>('google');
+  const [embedViewMode, setEmbedViewMode] = useState<'google' | 'direct' | 'text'>(() => {
+    if (book.pdfUrl) {
+      return getDefaultPdfViewMode(book.pdfUrl) === 'canvas' ? 'direct' : 'google';
+    }
+    if (book.downloadUrl && isGoogleBooksPreviewUrl(book.downloadUrl) && !book.customContent) {
+      return 'google';
+    }
+    return 'text';
+  });
   const [showSettings, setShowSettings] = useState(false);
 
-  const isLocalDataPdf = book.pdfUrl?.startsWith('data:') || book.pdfUrl?.startsWith('blob:');
+  const hasPdfDocument = !!book.pdfUrl?.trim();
+  const hasGooglePreview = !!book.downloadUrl?.trim() && isGoogleBooksPreviewUrl(book.downloadUrl) && !book.customContent?.trim();
+  const resolvedPdfUrl = resolvePdfUrl(book.pdfUrl);
+  const previewUrl = book.downloadUrl || '';
+  const cleanPreviewDescription = truncateText(stripHtml(book.description), 320);
+  const isLocalDataPdf =
+    resolvedPdfUrl.startsWith('data:')
+    || resolvedPdfUrl.startsWith('blob:')
+    || resolvedPdfUrl.startsWith('/uploads/');
+  const preferCanvasViewer = isSameOriginPdfUrl(resolvedPdfUrl);
 
   useEffect(() => {
-    if (isLocalDataPdf && embedViewMode === 'google') {
-      setEmbedViewMode('direct');
+    if (book.pdfUrl) {
+      setEmbedViewMode(getDefaultPdfViewMode(book.pdfUrl) === 'canvas' ? 'direct' : 'google');
+      return;
     }
-  }, [book.pdfUrl, isLocalDataPdf]);
+    if (hasGooglePreview) {
+      setEmbedViewMode('google');
+      return;
+    }
+    setEmbedViewMode('text');
+  }, [book.id, book.pdfUrl, book.downloadUrl, book.customContent, hasGooglePreview]);
 
-  const getEmbeddableUrl = (url: string, mode: 'google' | 'direct') => {
-    if (!url) return '';
-    const trimmed = url.trim();
-    
-    // Base64 data URLs or local Blob URLs cannot be passed to Google Docs Viewer service.
-    // They must be rendered directly in native browser iframe/object tags.
-    if (trimmed.startsWith('data:') || trimmed.startsWith('blob:') || mode === 'direct') {
-      return trimmed;
-    }
-
-    if (trimmed.includes('drive.google.com/file/d/')) {
-      const match = trimmed.match(/\/file\/d\/([^\/]+)/);
-      if (match && match[1]) {
-        return `https://drive.google.com/file/d/${match[1]}/preview`;
-      }
-    }
-    if (mode === 'google') {
-      return `https://docs.google.com/gview?url=${encodeURIComponent(trimmed)}&embedded=true`;
-    }
-    return trimmed;
-  };
+  const getEmbeddableUrl = (url: string, mode: 'google' | 'direct') =>
+    mode === 'google' ? getGoogleViewerUrl(url) : getDirectEmbedUrl(url);
   const [showChapters, setShowChapters] = useState(false);
   
   // Search state
@@ -2632,31 +3077,35 @@ export function BookReader({ book, onClose, theme, currentUser, setCurrentUser }
   const [isSearchActive, setIsSearchActive] = useState(false);
 
   // Notes state
-  const [notes, setNotes] = useState<NoteItem[]>(() => {
-    const saved = localStorage.getItem(`cineverse_notes_${book.id}`);
-    return saved ? JSON.parse(saved) : [];
-  });
+  const [notes, setNotes] = useState<NoteItem[]>([]);
   const [showNotesPanel, setShowNotesPanel] = useState(false);
   const [newNoteComment, setNewNoteComment] = useState('');
   const [selectedQuote, setSelectedQuote] = useState('');
 
   // Bookmarks
-  const [bookmarks, setBookmarks] = useState<number[]>(() => {
-    const saved = localStorage.getItem(`cineverse_bookmarks_${book.id}`);
-    return saved ? JSON.parse(saved) : [];
-  });
+  const [bookmarks, setBookmarks] = useState<number[]>([]);
 
-  // Level progress celebration state
-  const [celebration, setCelebration] = useState<{ show: boolean; type: 'mid' | 'full'; points: number } | null>(null);
+  useEffect(() => {
+    if (!currentUser?.id) {
+      setNotes([]);
+      setBookmarks([]);
+      return;
+    }
+    setNotes(loadStoredNotes(currentUser.id, book.id));
+    setBookmarks(loadStoredBookmarks(currentUser.id, book.id));
+  }, [currentUser?.id, book.id]);
 
-  // Save notes to localStorage
+  // Save notes to localStorage (per-user)
   const saveNotes = (updated: NoteItem[]) => {
     setNotes(updated);
-    localStorage.setItem(`cineverse_notes_${book.id}`, JSON.stringify(updated));
+    if (!currentUser?.id) return;
+    localStorage.setItem(getBookNotesStorageKey(currentUser.id, book.id), JSON.stringify(updated));
   };
 
   // Toggle bookmark
   const toggleBookmark = () => {
+    if (!currentUser?.id) return;
+
     let updated: number[];
     if (bookmarks.includes(globalPageIndex)) {
       updated = bookmarks.filter(idx => idx !== globalPageIndex);
@@ -2664,8 +3113,12 @@ export function BookReader({ book, onClose, theme, currentUser, setCurrentUser }
       updated = [...bookmarks, globalPageIndex];
     }
     setBookmarks(updated);
-    localStorage.setItem(`cineverse_bookmarks_${book.id}`, JSON.stringify(updated));
+    localStorage.setItem(getBookBookmarksStorageKey(currentUser.id, book.id), JSON.stringify(updated));
   };
+
+  // Level progress celebration state
+  const [celebration, setCelebration] = useState<{ show: boolean; type: 'mid' | 'full'; points: number } | null>(null);
+  const progressSyncTimerRef = React.useRef<ReturnType<typeof setTimeout> | null>(null);
 
   // Sync reading progress
   React.useEffect(() => {
@@ -2699,7 +3152,8 @@ export function BookReader({ book, onClose, theme, currentUser, setCurrentUser }
       const updatedUser: User = {
         ...currentUser,
         readingProgress: updatedProgress,
-        points: finalPoints
+        points: finalPoints,
+        badge: getHighestBadgeForPoints(finalPoints).name,
       };
 
       // Add notification if rewarded
@@ -2721,6 +3175,23 @@ export function BookReader({ book, onClose, theme, currentUser, setCurrentUser }
       setCurrentUser(updatedUser);
     }
   }, [globalPageIndex, allPages.length]);
+
+  React.useEffect(() => {
+    if (!currentUser) return;
+
+    const progressPercent = Math.round(((globalPageIndex + 1) / allPages.length) * 100);
+    if (progressSyncTimerRef.current) clearTimeout(progressSyncTimerRef.current);
+
+    progressSyncTimerRef.current = setTimeout(() => {
+      apiUpdateReadingProgress(book.id, progressPercent).catch((err) => {
+        console.warn('Oxuma progressi backend-ə yazıla bilmədi:', err);
+      });
+    }, 800);
+
+    return () => {
+      if (progressSyncTimerRef.current) clearTimeout(progressSyncTimerRef.current);
+    };
+  }, [globalPageIndex, allPages.length, book.id, currentUser?.id]);
 
   // Handle Search input
   const handleSearch = (query: string) => {
@@ -2758,6 +3229,7 @@ export function BookReader({ book, onClose, theme, currentUser, setCurrentUser }
   // Add customized note
   const handleAddNote = (e: React.FormEvent) => {
     e.preventDefault();
+    if (!currentUser?.id) return;
     if (!newNoteComment.trim()) return;
 
     const newNote: NoteItem = {
@@ -3140,6 +3612,10 @@ export function BookReader({ book, onClose, theme, currentUser, setCurrentUser }
               <button onClick={() => setShowNotesPanel(false)} className="p-1 rounded-full hover:bg-black/10"><X className="w-3.5 h-3.5" /></button>
             </div>
 
+            <div className="p-2.5 rounded-xl border border-amber-500/20 bg-amber-500/10 text-[10px] text-amber-500 leading-relaxed">
+              Qeydlər və bookmark-lar bu brauzerdə hesabınıza bağlı saxlanılır. Backend API əlavə olunduqda bulud sinxronizasiyası aktivləşəcək.
+            </div>
+
             {/* New note form */}
             <form onSubmit={handleAddNote} className="space-y-3 p-3 rounded-xl border bg-black/5 border-black/10">
               <p className="text-[9px] text-zinc-500 font-bold uppercase tracking-wider">
@@ -3231,7 +3707,7 @@ export function BookReader({ book, onClose, theme, currentUser, setCurrentUser }
           className="flex-1 flex flex-col items-center justify-start p-3 sm:p-4 md:p-6 overflow-y-auto select-text"
           onMouseUp={handleTextSelection}
         >
-          {book.pdfUrl && embedViewMode !== 'text' ? (
+          {hasPdfDocument && embedViewMode !== 'text' ? (
             <div className="w-full max-w-4xl flex flex-col gap-3">
               {/* Header toolbar for PDF/Link viewer modes */}
               <div className="flex flex-wrap items-center justify-between gap-2 p-3 rounded-2xl bg-zinc-900 border border-zinc-800 text-xs">
@@ -3264,8 +3740,8 @@ export function BookReader({ book, onClose, theme, currentUser, setCurrentUser }
                   )}
                   <button
                     onClick={() => setEmbedViewMode('text')}
-                    className={`px-3 py-1.5 rounded-lg font-bold text-[11px] transition cursor-pointer flex items-center gap-1 ${
-                      embedViewMode === 'text' ? 'bg-red-600 text-white shadow-md' : 'text-zinc-400 hover:text-white'
+                    className={`px-3.5 py-1.5 rounded-lg font-bold text-[11px] transition cursor-pointer flex items-center gap-1 ${
+                      (embedViewMode as string) === 'text' ? 'bg-red-600 text-white shadow-md' : 'text-zinc-400 hover:text-white'
                     }`}
                     title="İnteraktiv E-Kitab Mətn Rejiminə Keç"
                   >
@@ -3274,7 +3750,7 @@ export function BookReader({ book, onClose, theme, currentUser, setCurrentUser }
                 </div>
 
                 <a 
-                  href={book.pdfUrl} 
+                  href={getDirectEmbedUrl(resolvedPdfUrl)} 
                   target="_blank" 
                   rel="noopener noreferrer" 
                   download={isLocalDataPdf ? `${book.title}.pdf` : undefined}
@@ -3284,13 +3760,22 @@ export function BookReader({ book, onClose, theme, currentUser, setCurrentUser }
                 </a>
               </div>
 
-              {/* PDF Container using HTML5 Canvas viewer */}
+              {/* PDF Container */}
               <div className="w-full flex justify-center">
-                <PdfCanvasViewer 
-                  pdfUrl={book.pdfUrl} 
-                  title={book.title} 
-                  onSwitchToTextMode={() => setEmbedViewMode('text')} 
-                />
+                {embedViewMode === 'google' || (!preferCanvasViewer && embedViewMode === 'direct') ? (
+                  <iframe
+                    src={getEmbeddableUrl(resolvedPdfUrl, embedViewMode === 'google' ? 'google' : 'direct')}
+                    title={`${book.title} PDF`}
+                    className="w-full h-[75vh] min-h-[550px] rounded-3xl border border-zinc-800/80 bg-zinc-950 shadow-2xl"
+                  />
+                ) : (
+                  <PdfCanvasViewer 
+                    pdfUrl={resolvedPdfUrl} 
+                    title={book.title} 
+                    onSwitchToTextMode={() => setEmbedViewMode('text')}
+                    onRequestGoogleViewer={() => setEmbedViewMode('google')}
+                  />
+                )}
               </div>
 
               {/* Fallback Banner */}
@@ -3312,7 +3797,7 @@ export function BookReader({ book, onClose, theme, currentUser, setCurrentUser }
                   </button>
                   <span>•</span>
                   <a 
-                    href={book.pdfUrl} 
+                    href={getDirectEmbedUrl(resolvedPdfUrl)} 
                     target="_blank" 
                     rel="noopener noreferrer" 
                     className="underline font-bold hover:text-white"
@@ -3320,6 +3805,35 @@ export function BookReader({ book, onClose, theme, currentUser, setCurrentUser }
                     Xarici Pəncərədə Aç ↗
                   </a>
                 </div>
+              </div>
+            </div>
+          ) : hasGooglePreview && embedViewMode !== 'text' ? (
+            <div className="w-full max-w-3xl flex flex-col gap-4">
+              <div className="p-5 sm:p-6 rounded-2xl border border-amber-500/25 bg-amber-500/10 text-sm leading-relaxed">
+                <p className="font-black uppercase tracking-wider text-amber-500 text-xs mb-2">Google Books Ön Baxış</p>
+                <p className="opacity-90">
+                  Bu kitab Google Books-dan idxal edilib. Tam mətn platformada saxlanılmır — yalnız ön baxış və qısa təsvir mövcuddur.
+                </p>
+                {cleanPreviewDescription && (
+                  <p className="mt-3 text-xs opacity-80 border-t border-amber-500/20 pt-3">{cleanPreviewDescription}</p>
+                )}
+              </div>
+
+              <div className="flex flex-wrap gap-2">
+                <a
+                  href={previewUrl}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="px-4 py-2.5 bg-red-600 hover:bg-red-500 text-white rounded-xl font-bold text-xs uppercase tracking-wider transition"
+                >
+                  Google Books-da Oxu ↗
+                </a>
+                <button
+                  onClick={() => setEmbedViewMode('text')}
+                  className={`px-4 py-2.5 rounded-xl font-bold text-xs uppercase tracking-wider transition ${style.inactiveBtn}`}
+                >
+                  Qısa Məlumat Rejimi
+                </button>
               </div>
             </div>
           ) : (
@@ -3331,7 +3845,7 @@ export function BookReader({ book, onClose, theme, currentUser, setCurrentUser }
                 
                 {/* PAGE 1 */}
                 <div 
-                  className={`relative p-6 md:p-12 rounded-3xl border shadow-xl flex flex-col justify-between aspect-[3/4] min-h-[450px] md:min-h-[580px] transition-all duration-300 ${style.bg} ${style.border}`}
+                  className={`relative p-5 md:p-8 rounded-2xl border shadow-lg flex flex-col justify-between min-h-[320px] md:min-h-[380px] transition-all duration-300 ${style.bg} ${style.border}`}
                   style={{ fontSize: `${fontSize}px` }}
                 >
                   {/* Bookmarked Ribbon Indicator */}
@@ -3366,7 +3880,7 @@ export function BookReader({ book, onClose, theme, currentUser, setCurrentUser }
                 {/* PAGE 2 (Side-by-side mode) */}
                 {showSecondPage && secondPage && (
                   <div 
-                    className={`relative p-6 md:p-12 rounded-3xl border shadow-xl flex flex-col justify-between aspect-[3/4] min-h-[450px] md:min-h-[580px] transition-all duration-300 hidden md:flex ${style.bg} ${style.border}`}
+                    className={`relative p-5 md:p-8 rounded-2xl border shadow-lg flex flex-col justify-between min-h-[320px] md:min-h-[380px] transition-all duration-300 hidden md:flex ${style.bg} ${style.border}`}
                     style={{ fontSize: `${fontSize}px` }}
                   >
                     {/* Bookmarked Ribbon Indicator */}
@@ -3407,7 +3921,7 @@ export function BookReader({ book, onClose, theme, currentUser, setCurrentUser }
 
       {/* READER FOOTER BAR CONTROLS */}
       <footer className={`px-4 py-3.5 border-t flex flex-col sm:flex-row gap-3 items-center justify-between shrink-0 ${style.border} ${style.panelBg}`}>
-        {book.pdfUrl && embedViewMode !== 'text' ? (
+        {hasPdfDocument && embedViewMode !== 'text' ? (
           <div className="w-full flex items-center justify-between gap-4 text-xs font-mono">
             <span className="text-zinc-400 font-bold flex items-center gap-2">
               <span className="w-2 h-2 rounded-full bg-emerald-500 animate-pulse" />
@@ -3421,12 +3935,32 @@ export function BookReader({ book, onClose, theme, currentUser, setCurrentUser }
                 📖 İnteraktiv Mətn Rejiminə Keç
               </button>
               <a
-                href={book.pdfUrl}
+                href={getDirectEmbedUrl(resolvedPdfUrl)}
                 target="_blank"
                 rel="noopener noreferrer"
                 className="px-3.5 py-1.5 bg-zinc-800 hover:bg-zinc-700 text-white rounded-xl font-bold transition"
               >
                 Tam Ekranda Aç ↗
+              </a>
+            </div>
+          </div>
+        ) : hasGooglePreview && embedViewMode !== 'text' ? (
+          <div className="w-full flex items-center justify-between gap-4 text-xs font-mono">
+            <span className="text-amber-500 font-bold">Google Books ön baxış rejimi</span>
+            <div className="flex items-center gap-3">
+              <button
+                onClick={() => setEmbedViewMode('text')}
+                className="px-3.5 py-1.5 bg-red-600 hover:bg-red-500 text-white rounded-xl font-bold transition cursor-pointer"
+              >
+                Qısa Məlumat Rejimi
+              </button>
+              <a
+                href={previewUrl}
+                target="_blank"
+                rel="noopener noreferrer"
+                className="px-3.5 py-1.5 bg-zinc-800 hover:bg-zinc-700 text-white rounded-xl font-bold transition"
+              >
+                Google Books-da Aç ↗
               </a>
             </div>
           </div>

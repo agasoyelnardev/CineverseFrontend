@@ -1,7 +1,8 @@
 import React, { useState, useEffect } from 'react';
-import { Film, Bell, Search, LogOut, User as UserIcon, Shield, Moon, Sun, Menu, X, Check, ChevronLeft, ChevronRight, Eye, EyeOff } from 'lucide-react';
+import { Film, Bell, Search, LogOut, User as UserIcon, Shield, Moon, Sun, Menu, X, Check, ChevronLeft, ChevronRight, Eye, EyeOff, Trash2 } from 'lucide-react';
 import { User, Notification } from '../types';
-import { apiMarkAllNotificationsAsRead, apiToggleNotificationRead, apiDeleteNotification, apiGetNotifications } from '../api';
+import { apiMarkAllNotificationsAsRead, apiToggleNotificationRead, apiDeleteNotification } from '../api';
+import { markNotificationAsReadRealtime } from '../signalr';
 
 interface NavbarProps {
   user: User;
@@ -12,6 +13,8 @@ interface NavbarProps {
   setIsAdminMode: (adminMode: boolean) => void;
   notifications: Notification[];
   setNotifications: React.Dispatch<React.SetStateAction<Notification[]>>;
+  realtimeUnreadCount?: number | null;
+  setRealtimeUnreadCount?: React.Dispatch<React.SetStateAction<number | null>>;
   searchQuery: string;
   setSearchQuery: (query: string) => void;
   theme: 'dark' | 'light';
@@ -29,6 +32,8 @@ export default function Navbar({
   setIsAdminMode,
   notifications,
   setNotifications,
+  realtimeUnreadCount,
+  setRealtimeUnreadCount,
   searchQuery,
   setSearchQuery,
   theme,
@@ -42,60 +47,90 @@ export default function Navbar({
   const [notifPage, setNotifPage] = useState(1);
   const notifsPerPage = 4;
 
-  useEffect(() => {
-    if (!user) return;
-    async function loadNotifications() {
-      try {
-        const data = await apiGetNotifications(1, 50);
-        if (data && Array.isArray(data.items)) {
-          const backendNotifs: Notification[] = data.items.map((item) => ({
-            id: item.id,
-            title: item.title,
-            description: item.description,
-            date: new Date(item.createdAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
-            read: item.isRead,
-            type: (item.type as any) || 'system',
-          }));
-          setNotifications(backendNotifs);
-        }
-      } catch (err) {
-        console.warn('Backend notifications fetch fallback to local state:', err);
-      }
-    }
-    loadNotifications();
-  }, [user]);
+  const unreadCount = realtimeUnreadCount ?? notifications.filter((n) => !n.read).length;
 
-  const unreadCount = notifications.filter((n) => !n.read).length;
+  const markNotificationRead = async (notifId: string, wasUnread: boolean) => {
+    if (!wasUnread) return;
+    try {
+      await markNotificationAsReadRealtime(notifId);
+    } catch (err) {
+      console.warn('Realtime mark notification read failed, falling back to API:', err);
+      await apiToggleNotificationRead(notifId);
+    }
+  };
 
   const handleMarkAllRead = async () => {
+    const previousNotifications = notifications;
+    const previousUnread = realtimeUnreadCount;
     setNotifications((prev) => prev.map((n) => ({ ...n, read: true })));
+    setRealtimeUnreadCount?.(0);
     try {
       await apiMarkAllNotificationsAsRead();
     } catch (err) {
       console.warn('Backend mark all notifications read synced locally:', err);
+      setNotifications(previousNotifications);
+      setRealtimeUnreadCount?.(previousUnread ?? null);
     }
   };
 
   const handleToggleSingleRead = async (e: React.MouseEvent, notifId: string) => {
     e.stopPropagation();
+    const target = notifications.find((n) => n.id === notifId);
+    const previousRead = target?.read ?? false;
+    const willBeRead = !previousRead;
+
     setNotifications((prev) =>
-      prev.map((n) => (n.id === notifId ? { ...n, read: !n.read } : n))
+      prev.map((n) => (n.id === notifId ? { ...n, read: willBeRead } : n))
     );
+    if (setRealtimeUnreadCount && realtimeUnreadCount !== null && target) {
+      setRealtimeUnreadCount(willBeRead ? Math.max(0, realtimeUnreadCount - 1) : realtimeUnreadCount + 1);
+    }
     try {
-      await apiToggleNotificationRead(notifId);
+      if (willBeRead) {
+        await markNotificationRead(notifId, true);
+      } else {
+        await apiToggleNotificationRead(notifId);
+      }
     } catch (err) {
       console.warn('Backend toggle notification read synced locally:', err);
+      setNotifications((prev) =>
+        prev.map((n) => (n.id === notifId ? { ...n, read: previousRead } : n))
+      );
+      if (setRealtimeUnreadCount && realtimeUnreadCount !== null && target) {
+        setRealtimeUnreadCount(previousRead ? realtimeUnreadCount + 1 : Math.max(0, realtimeUnreadCount - 1));
+      }
+    }
+  };
+
+  const handleDeleteNotification = async (e: React.MouseEvent, notifId: string) => {
+    e.stopPropagation();
+    const target = notifications.find((n) => n.id === notifId);
+    setNotifications((prev) => prev.filter((n) => n.id !== notifId));
+    if (target && !target.read && setRealtimeUnreadCount && realtimeUnreadCount !== null) {
+      setRealtimeUnreadCount(Math.max(0, realtimeUnreadCount - 1));
+    }
+    try {
+      await apiDeleteNotification(notifId);
+    } catch (err) {
+      console.warn('Backend notification delete failed:', err);
     }
   };
 
   const handleNotificationClick = async (notifId: string) => {
-    setNotifications((prev) =>
-      prev.map((n) => (n.id === notifId ? { ...n, read: true } : n))
-    );
+    const clickedNotifBefore = notifications.find((n) => n.id === notifId);
+    const wasUnread = clickedNotifBefore ? !clickedNotifBefore.read : false;
+
+    setNotifications((prev) => {
+      const target = prev.find((n) => n.id === notifId);
+      if (setRealtimeUnreadCount && realtimeUnreadCount !== null && target && !target.read) {
+        setRealtimeUnreadCount(Math.max(0, realtimeUnreadCount - 1));
+      }
+      return prev.map((n) => (n.id === notifId ? { ...n, read: true } : n));
+    });
     setShowNotifications(false);
 
     try {
-      await apiToggleNotificationRead(notifId);
+      await markNotificationRead(notifId, wasUnread);
     } catch (err) {
       // ignore
     }
@@ -291,17 +326,18 @@ export default function Navbar({
                             </span>
                             <span className="text-[9px] text-zinc-500 font-mono">{n.date}</span>
                           </div>
-                          <p className={`font-bold text-[11px] leading-tight pr-6 ${
+                          <p className={`font-bold text-[11px] leading-tight pr-12 ${
                             theme === 'dark' ? 'text-white' : 'text-zinc-900'
                           }`}>{n.title}</p>
-                          <p className={`text-[10px] leading-snug pr-6 ${
+                          <p className={`text-[10px] leading-snug pr-12 ${
                             theme === 'dark' ? 'text-zinc-400' : 'text-zinc-600 font-medium'
                           }`}>{n.description}</p>
 
+                          <div className="absolute right-2 top-1/2 -translate-y-1/2 flex flex-col gap-1 opacity-0 group-hover:opacity-100 transition-all duration-200">
                           {/* Inline Mark Read / Unread Action */}
                           <button
                             onClick={(e) => handleToggleSingleRead(e, n.id)}
-                            className={`absolute right-2 top-1/2 -translate-y-1/2 p-1 rounded-md opacity-0 group-hover:opacity-100 transition-all duration-200 cursor-pointer hover:scale-105 ${
+                            className={`p-1 rounded-md transition-all duration-200 cursor-pointer hover:scale-105 ${
                               theme === 'dark'
                                 ? 'bg-zinc-800 text-zinc-300 hover:bg-zinc-700 hover:text-white'
                                 : 'bg-zinc-200 text-zinc-600 hover:bg-zinc-300 hover:text-zinc-900'
@@ -310,6 +346,18 @@ export default function Navbar({
                           >
                             {n.read ? <EyeOff className="w-3.5 h-3.5" /> : <Eye className="w-3.5 h-3.5" />}
                           </button>
+                          <button
+                            onClick={(e) => handleDeleteNotification(e, n.id)}
+                            className={`p-1 rounded-md transition-all duration-200 cursor-pointer hover:scale-105 ${
+                              theme === 'dark'
+                                ? 'bg-zinc-800 text-zinc-300 hover:bg-red-600 hover:text-white'
+                                : 'bg-zinc-200 text-zinc-600 hover:bg-red-100 hover:text-red-600'
+                            }`}
+                            title="Bildirişi sil"
+                          >
+                            <Trash2 className="w-3.5 h-3.5" />
+                          </button>
+                          </div>
                         </div>
                       ))
                     )}
