@@ -260,6 +260,7 @@ useEffect(() => {
 
       if (mappedUser.role === 'admin') {
         setIsAdminMode(true);
+        setCurrentView('admin');
       }
     } catch (err) {
       console.warn('Sessiya bərpa oluna bilmədi, yenidən login lazımdır:', err);
