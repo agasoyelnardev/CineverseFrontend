@@ -22,6 +22,7 @@ import {
   getWatchPartyUrl,
 } from './utils/watchPartyUrl';
 import { isRoomHost, resolveLocalUsername } from './utils/watchPartyUtils';
+import { getStreamPlaybackInfo } from './utils/streamPlayback';
 
 import LoginRegister from './components/LoginRegister';
 import WatchPartyGuestPreview from './components/WatchPartyGuestPreview';
@@ -166,6 +167,7 @@ function mapBackendMovie(m: any): Movie {
     trailerUrl: m.trailerUrl,
     videoUrl: m.videoUrl,
     externalUrl: m.externalUrl,
+    bookSourceId: normalizeEntityId(m.bookSourceId ?? m.BookSourceId ?? m.bookSource?.id ?? m.BookSource?.Id) || undefined,
     likes: m.likes || 0,
     reviews: [],
     isTrending: m.isTrending,
@@ -189,7 +191,9 @@ function mapBackendBook(b: any): Book {
     reviews: [],
     likes: b.likes || 0,
     isLikedByCurrentUser: !!(b.isLikedByCurrentUser ?? b.IsLikedByCurrentUser),
-    movieAdaptationId: b.movieAdaptationId,
+    movieAdaptationId: normalizeEntityId(
+      b.movieAdaptationId ?? b.MovieAdaptationId ?? b.movieAdaptations?.[0]?.id ?? b.MovieAdaptations?.[0]?.Id,
+    ) || undefined,
     downloadUrl: b.downloadUrl,
     pdfUrl: b.pdfUrl ?? b.PdfUrl,
     customContent: b.customContent,
@@ -2865,6 +2869,10 @@ useEffect(() => {
 
   // Filter movies for Movies Grid page — server-side results
   const filteredMoviesList = moviesListResults;
+  const trailerPlayback = getStreamPlaybackInfo(selectedMovie?.trailerUrl || '');
+  const moviePlayback = getStreamPlaybackInfo(
+    selectedMovie?.videoUrl || 'https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/BigBuckBunny.mp4',
+  );
 
   // Global search filtering for instant results popup / query focus
   const searchResults = movies.filter((m) =>
@@ -5124,7 +5132,8 @@ useEffect(() => {
 
                       {/* Book Adaptation Link block */}
                       {(() => {
-                        const linkedBook = books.find(b => b.movieAdaptationId === selectedMovie.id);
+                        const linkedBook = books.find(b => b.id === selectedMovie.bookSourceId)
+                          ?? books.find(b => b.movieAdaptationId === selectedMovie.id);
                         if (!linkedBook) return null;
                         return (
                           <div className={`p-6 rounded-3xl border ${
@@ -5287,20 +5296,39 @@ useEffect(() => {
 
                           {/* 2. Youtube Trailer Mode */}
                           {activePlayerMode === 'trailer' && (
-                            <iframe
-                              src={selectedMovie.trailerUrl}
-                              title={`${selectedMovie.title} rəsmi treyler`}
-                              className="w-full h-full object-cover"
-                              allowFullScreen
-                            />
+                            trailerPlayback.mode === 'iframe' ? (
+                              <iframe
+                                src={trailerPlayback.src}
+                                title={`${selectedMovie.title} rəsmi treyler`}
+                                className="w-full h-full object-cover"
+                                allow="autoplay; encrypted-media; picture-in-picture"
+                                allowFullScreen
+                              />
+                            ) : (
+                              <video
+                                src={trailerPlayback.src}
+                                className="w-full h-full object-contain"
+                                controls
+                                playsInline
+                              />
+                            )
                           )}
 
                           {/* 3. Custom HTML5 Video Player Mode */}
                           {activePlayerMode === 'movie' && (
+                            moviePlayback.mode === 'iframe' ? (
+                              <iframe
+                                src={moviePlayback.src}
+                                title={`${selectedMovie.title} tam film`}
+                                className="w-full h-full"
+                                allow="autoplay; encrypted-media; picture-in-picture"
+                                allowFullScreen
+                              />
+                            ) : (
                             <div className="w-full h-full relative bg-black flex items-center justify-center overflow-hidden">
                               <video
                                 ref={videoRef}
-                                src={selectedMovie.videoUrl || 'https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/BigBuckBunny.mp4'}
+                                src={moviePlayback.src}
                                 onClick={togglePlay}
                                 onTimeUpdate={handleTimeUpdate}
                                 onLoadedMetadata={handleLoadedMetadata}
@@ -5464,6 +5492,7 @@ useEffect(() => {
                                 </div>
                               </div>
                             </div>
+                            )
                           )}
                         </div>
 

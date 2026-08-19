@@ -16,7 +16,9 @@ export function mapBackendBook(b: any): Book {
     reviews: [],
     likes: b.likes ?? b.Likes ?? 0,
     isLikedByCurrentUser: !!(b.isLikedByCurrentUser ?? b.IsLikedByCurrentUser),
-    movieAdaptationId: b.movieAdaptationId ?? b.MovieAdaptationId,
+    movieAdaptationId: normalizeEntityId(
+      b.movieAdaptationId ?? b.MovieAdaptationId ?? b.movieAdaptations?.[0]?.id ?? b.MovieAdaptations?.[0]?.Id,
+    ) || undefined,
     downloadUrl: b.downloadUrl ?? b.DownloadUrl,
     pdfUrl: b.pdfUrl ?? b.PdfUrl,
     customContent: b.customContent ?? b.CustomContent,

@@ -1152,8 +1152,8 @@ export default function AdminPanel({
       title: newMovie.title,
       originalTitle: newMovie.originalTitle || undefined,
       description: newMovie.description,
-      poster: newMovie.poster || undefined,
-      banner: newMovie.banner || undefined,
+      poster: newMovie.poster.trim(),
+      banner: newMovie.banner.trim(),
       year: Number(newMovie.year) || undefined,
       duration: newMovie.duration || undefined,
       director: newMovie.director || undefined,
@@ -1175,7 +1175,8 @@ export default function AdminPanel({
         setApiMessage({ type: 'success', text: `"${newMovie.title}" filmi backend bazasında uğurla yeniləndi (PUT /api/Movies/${editingMovieId}).` });
       } catch (err: any) {
         console.log('Backend API update movie error:', err.message);
-        setApiMessage({ type: 'success', text: `"${newMovie.title}" filmi lokal olaraq yeniləndi.` });
+        setApiMessage({ type: 'error', text: `Film yadda saxlanılmadı: ${err.message || 'backend xətası'}` });
+        return;
       }
 
       setMovies(prev => prev.map(m => {
@@ -1195,6 +1196,7 @@ export default function AdminPanel({
             trailerUrl: newMovie.trailerUrl || m.trailerUrl,
             videoUrl: newMovie.videoUrl || m.videoUrl,
             externalUrl: newMovie.externalUrl || (m as any).externalUrl,
+            bookSourceId: newMovie.bookSourceId || undefined,
             isTrending: newMovie.isTrending,
             isTopRated: newMovie.isTopRated,
             isNewRelease: newMovie.isNewRelease
@@ -1202,6 +1204,14 @@ export default function AdminPanel({
         }
         return m;
       }));
+      setBooks(prev => prev.map(book => ({
+        ...book,
+        movieAdaptationId: book.id === newMovie.bookSourceId
+          ? editingMovieId
+          : book.movieAdaptationId === editingMovieId
+            ? undefined
+            : book.movieAdaptationId,
+      })));
     } else {
       // CREATE MOVIE (POST /api/Movies)
       const newId = 'm_' + Date.now();
@@ -1220,6 +1230,7 @@ export default function AdminPanel({
         banner: newMovie.banner,
         trailerUrl: newMovie.trailerUrl || 'https://www.youtube.com/embed/zSWdZVtXT7E',
         videoUrl: newMovie.videoUrl || 'https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/BigBuckBunny.mp4',
+        bookSourceId: newMovie.bookSourceId || undefined,
         likes: 0,
         reviews: [],
         isTrending: newMovie.isTrending,
@@ -1229,8 +1240,9 @@ export default function AdminPanel({
 
       try {
         const res = await apiCreateMovie(payload);
-        if (res && res.id) {
-          formattedMovie.id = res.id;
+        const createdMovieId = typeof res === 'string' ? res : res?.id ?? res?.Id;
+        if (createdMovieId) {
+          formattedMovie.id = String(createdMovieId);
         }
         setApiMessage({ type: 'success', text: `"${newMovie.title}" filmi backend bazasına əlavə olundu (POST /api/Movies).` });
       } catch (err: any) {
@@ -1238,6 +1250,13 @@ export default function AdminPanel({
       }
 
       setMovies(prev => [formattedMovie, ...prev]);
+      if (newMovie.bookSourceId) {
+        setBooks(prev => prev.map(book =>
+          book.id === newMovie.bookSourceId
+            ? { ...book, movieAdaptationId: formattedMovie.id }
+            : book,
+        ));
+      }
     }
 
     setShowAddMovieModal(false);
@@ -2350,22 +2369,22 @@ export default function AdminPanel({
 
                   <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
                     <div>
-                      <label className="block text-xs font-medium text-zinc-400 mb-1">Trailer Embed URL</label>
+                      <label className="block text-xs font-medium text-zinc-400 mb-1">Treyler URL (YouTube linki və ya embed)</label>
                       <input
                         type="text"
                         value={newMovie.trailerUrl}
                         onChange={e => setNewMovie(prev => ({ ...prev, trailerUrl: e.target.value }))}
-                        placeholder="https://www.youtube.com/embed/..."
+                        placeholder="https://www.youtube.com/watch?v=..."
                         className="w-full px-3 py-2 bg-zinc-950 border border-zinc-800 rounded-xl text-xs text-white"
                       />
                     </div>
                     <div>
-                      <label className="block text-xs font-medium text-zinc-400 mb-1">Tam Film Video URL</label>
+                      <label className="block text-xs font-medium text-zinc-400 mb-1">Tam Film URL (MP4/HLS və ya Google Drive)</label>
                       <input
                         type="text"
                         value={newMovie.videoUrl}
                         onChange={e => setNewMovie(prev => ({ ...prev, videoUrl: e.target.value }))}
-                        placeholder="https://..."
+                        placeholder="https://drive.google.com/file/d/.../view"
                         className="w-full px-3 py-2 bg-zinc-950 border border-zinc-800 rounded-xl text-xs text-white"
                       />
                     </div>

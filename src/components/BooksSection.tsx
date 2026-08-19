@@ -101,6 +101,14 @@ export default function BooksSection({
   const [selectedBook, setSelectedBook] = useState<Book | null>(null);
   const [activeReaderBook, setActiveReaderBook] = useState<Book | null>(null);
 
+  // Kitab kartından detail görünüşünə keçəndə əsas scroll konteyneri əvvəlki
+  // kart siyahısı mövqeyində qalmasın; detail həmişə başdan açılsın.
+  useEffect(() => {
+    if (!selectedBook?.id) return;
+
+    document.querySelector<HTMLElement>('main')?.scrollTo({ top: 0, behavior: 'auto' });
+  }, [selectedBook?.id]);
+
   useEffect(() => {
     if (activeTab !== 'all') return;
 
@@ -134,7 +142,7 @@ export default function BooksSection({
           reviews: [],
           likes: b.likes || 0,
           isLikedByCurrentUser: !!(b.isLikedByCurrentUser ?? b.IsLikedByCurrentUser),
-          movieAdaptationId: b.movieAdaptationId,
+          movieAdaptationId: b.movieAdaptationId ?? b.MovieAdaptationId ?? b.movieAdaptations?.[0]?.id ?? b.MovieAdaptations?.[0]?.Id,
           downloadUrl: b.downloadUrl,
           pdfUrl: b.pdfUrl ?? b.PdfUrl,
           customContent: b.customContent,
@@ -182,7 +190,7 @@ export default function BooksSection({
         reviews: [],
         likes: b.likes || 0,
         isLikedByCurrentUser: !!(b.isLikedByCurrentUser ?? b.IsLikedByCurrentUser),
-        movieAdaptationId: b.movieAdaptationId,
+        movieAdaptationId: b.movieAdaptationId ?? b.MovieAdaptationId ?? b.movieAdaptations?.[0]?.id ?? b.MovieAdaptations?.[0]?.Id,
         downloadUrl: b.downloadUrl,
         pdfUrl: b.pdfUrl,
         customContent: b.customContent,
